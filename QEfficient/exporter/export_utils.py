@@ -117,7 +117,7 @@ def export_onnx(
         True,
         True,
     )
-
+    print("Shape inference ran successfully")
     info(f"input names {input_names}")
     info(f"output names {output_names}")
     info(f"Initial Model Export Completed...{model_base_name}")
@@ -307,6 +307,12 @@ def run_model_on_ort(
             info_string = "fp16"
         ort_session = onnxruntime.InferenceSession(onnx_path)
         input_names = [x.name for x in ort_session.get_inputs()]
+        dir_inputs = {k: v.detach().numpy() for k, v in inputs.items() if k in input_names}
+        import pickle
+        with open("ort_inputs.pkl", "wb") as tmpf:
+            pickle.dump(dir_inputs, tmpf)
+        import ipdb
+        ipdb.set_trace()
         ort_outputs = ort_session.run(
             output_names,
             {k: v.detach().numpy() for k, v in inputs.items() if k in input_names},

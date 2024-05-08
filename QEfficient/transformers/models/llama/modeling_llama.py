@@ -233,7 +233,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
 
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states.float())
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -249,7 +249,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states.float())
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -325,12 +325,11 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
             past_key_values=past_key_values,
             cache_index=cache_index,
             inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
+            use_cache=True,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-
         hidden_states = outputs[0]
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
@@ -338,7 +337,7 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
             logits = torch.cat(logits, dim=-1)
         else:
             # Added by HU
-            logits = self.lm_head(hidden_states[:, -1, :])
+            logits = self.lm_head(hidden_states[:, -1, :].float())
         logits = logits.float()
 
         loss = None
@@ -503,7 +502,7 @@ class QEffLlamaModel(LlamaModel):
             cache_index,
         )
 
-        hidden_states = inputs_embeds
+        hidden_states = inputs_embeds.float()
 
         if self.gradient_checkpointing and self.training:
             if use_cache:

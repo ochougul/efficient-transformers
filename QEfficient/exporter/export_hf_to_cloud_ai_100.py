@@ -296,11 +296,11 @@ def convert_to_cloud_kvstyle(
     else:
         inputs = tokenizer(input_str, return_tensors="pt")
 
-    try:
-        pt_outputs = model(**inputs)
-        output_names = list(pt_outputs.keys())
-    except Exception as e:
-        print(f"Model {model_name} Execution failed in pytorch:%s", e)
+    # try:
+    pt_outputs = model(**inputs)
+    output_names = list(pt_outputs.keys())
+    # except Exception as e:
+    #     print(f"Model {model_name} Execution failed in pytorch:%s", e)
 
     # Raise error if expected outputs are not present
     assert "logits" in output_names, "logits not found in output"
@@ -337,6 +337,8 @@ def convert_to_cloud_kvstyle(
         pt_outputs[f"past_key.{i}_RetainedState"] = key
         pt_outputs[f"past_value.{i}_RetainedState"] = value
 
+    import ipdb
+    ipdb.set_trace()
     # Export and simplify ONNX model
     fp32_model_name = export_onnx(
         pt_model=model,
@@ -345,7 +347,8 @@ def convert_to_cloud_kvstyle(
         gen_models_path=onnx_dir_path,
         model_base_name=model_base_name,
     )
-
+    import ipdb
+    ipdb.set_trace()
     # Replace nested past_key_values inputs with separate KV tensors
     inputs.pop("past_key_values")
     for i, (key, value) in enumerate(pkv):
