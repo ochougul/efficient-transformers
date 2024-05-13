@@ -44,7 +44,7 @@ class InputHandler:
             padding="max_length",
             max_length=self.prompt_len,
         )
-        batch_size, input_len = inputs["input_ids"].shape
+        batch_size, _ = inputs["input_ids"].shape
         inputs["attention_mask"] = torch.concat(
             [
                 inputs["attention_mask"],
@@ -112,7 +112,7 @@ class InputHandler:
         inputs = {}
         inputs["input_ids"] = input_ids
 
-        batch_size, input_len = inputs["input_ids"].shape
+        _, input_len = inputs["input_ids"].shape
 
         if len(position_ids.shape) == 1:
             inputs["position_ids"] = position_ids.astype(np.int64)[:, np.newaxis]

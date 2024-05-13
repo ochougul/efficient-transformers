@@ -57,9 +57,8 @@ def main(
     prompt_len: int = 32,
     ctx_len: int = 128,
     mxfp6: bool = False,
-    device_group: List[int] = [
-        0,
-    ],
+    device_group: List[int] = [0, ],
+    awq=False
 ) -> None:
     # Make
     model_card_dir = os.path.join(QEFF_MODELS_DIR, str(model_name))
@@ -207,6 +206,7 @@ if __name__ == "__main__":
         default=-1,
         help="Effort level to reduce the on-chip memory",
     )
+    parser.add_argument("--awq", action="store_true", help="Pass when the model being passed in AWQ model, only int4 quantization with gemm version supported.")
 
     args = parser.parse_args()
     main(**args.__dict__)
