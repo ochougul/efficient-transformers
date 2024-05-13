@@ -58,7 +58,7 @@ def main(
     ctx_len: int = 128,
     mxfp6: bool = False,
     device_group: List[int] = [0, ],
-    awq=False
+    awq: bool = False
 ) -> None:
     # Make
     model_card_dir = os.path.join(QEFF_MODELS_DIR, str(model_name))
@@ -115,7 +115,17 @@ def main(
     #############################################
     # hf model -> export -> compile -> execute
     #############################################
-    model_hf = AutoModelForCausalLM.from_pretrained(model_hf_path, use_cache=True)
+    if awq:
+        '''
+        1. Load pretrained model -> replace gemm layers -> load weights -> return
+        2. Repack to ORT packing mode
+        '''
+        model_hf = load_quantized_model()
+        pass
+    else:
+        model_hf = AutoModelForCausalLM.from_pretrained(model_hf_path, use_cache=True)
+
+    
     # Easy and minimal api to update the model to QEff.
     model_transformed = QEfficient.transform(model_hf, type="Transformers", form_factor="cloud")
     logger.info(f"Model after Optimized transformations {model_transformed}")
