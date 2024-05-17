@@ -173,7 +173,7 @@ def cloud_ai_100_exec_kv(
     session.skip_buffers(["attention_mask"])
     loop_start = perf_counter()
     finished_sequences = next_token_id == tokenizer.eos_token_id
-    while not finished_sequences.all() and cache_index[0] < generation_len:
+    while cache_index[0] < generation_len:
         outputs = session.run(inputs)
         if write_io_dir:
             write_io_files(inputs, outputs, write_io_dir, "decode", "aic_batch_io", True, False)
