@@ -23,6 +23,10 @@ from transformers.models.codegen.modeling_codegen import (
 
 from QEfficient.transformers.modeling_attn_mask_utils import QEffAttentionMaskConverter
 from QEfficient.transformers.modeling_outputs import QEffBaseModelOutputWithPast, QEffCausalLMOutputWithPast
+from QEfficient.transformers.models.mapper import map_to_qeff
+
+# Following classes are required to be imported for import * from this file.
+__all__ = ["QEffCodeGenAttention", "QEffCodeGenBlock", "QEffCodeGenForCausalLM", "QEffCodeGenModel"]
 
 
 # Copied from transformers.models.gptj.modeling_gptj.apply_rotary_pos_emb
@@ -33,7 +37,7 @@ def apply_rotary_pos_emb(tensor: torch.Tensor, sin: torch.Tensor, cos: torch.Ten
     cos = cos.reshape(-1, 1).repeat(1, 2).reshape(*cos_shape, 1, 2 * cos_last_shape)
     return (tensor * cos) + (rotate_every_two(tensor) * sin)
 
-
+@map_to_qeff(CodeGenAttention)
 class QEffCodeGenAttention(CodeGenAttention):
     """
     Copied from CodeGenAttention: https://github.com/huggingface/transformers/blob/main/src/transformers/models/codegen/modeling_codegen.py
@@ -190,7 +194,7 @@ class QEffCodeGenAttention(CodeGenAttention):
 
         return outputs  # a, present, (attentions)
 
-
+@map_to_qeff(CodeGenBlock)
 class QEffCodeGenBlock(CodeGenBlock):
     """
     Copied from CodeGenBlock: https://github.com/huggingface/transformers/blob/main/src/transformers/models/codegen/modeling_codegen.py
@@ -237,7 +241,7 @@ class QEffCodeGenBlock(CodeGenBlock):
 
         return outputs  # hidden_states, present, (attentions)
 
-
+@map_to_qeff(CodeGenModel)
 class QEffCodeGenModel(CodeGenModel):
     """
     Copied from CodeGenModel: https://github.com/huggingface/transformers/blob/main/src/transformers/models/codegen/modeling_codegen.py
@@ -403,7 +407,7 @@ class QEffCodeGenModel(CodeGenModel):
             attention_mask_RetainedState=attention_mask_retained if cache_index is not None else None,
         )
 
-
+@map_to_qeff(CodeGenForCausalLM)
 class QEffCodeGenForCausalLM(CodeGenForCausalLM):
     """
     Copied from CodeGenForCausalLM: https://github.com/huggingface/transformers/blob/main/src/transformers/models/codegen/modeling_codegen.py

@@ -5,3 +5,10 @@
 #
 # -----------------------------------------------------------------------------
 
+from QEfficient.transformers.models.mistral.modeling_mistral import (  # noqa: F401
+    QEffMistralAttention,
+    QEffMistralDecoderLayer,
+    QEffMistralForCausalLM,
+    QEffMistralModel,
+    QEffMistralRotaryEmbedding,
+)

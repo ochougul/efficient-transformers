@@ -27,7 +27,9 @@ from QEfficient.transformers.modeling_outputs import (
     QEffBaseModelOutputWithPast,
     QEffCausalLMOutputWithPast,
 )
+from QEfficient.
 
+__all__ = ["QEffLlamaAttention", "QEffLlamaDecoderLayer", "QEffLlamaForCausalLM", "QEffLlamaModel"]
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -85,6 +87,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 
+@
 class QEffLlamaAttention(LlamaAttention):
     """
     Copied from LlamaForCausalLM: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py

@@ -5,3 +5,9 @@
 #
 # -----------------------------------------------------------------------------
 
+from QEfficient.transformers.models.mpt.modeling_mpt import (  # noqa: F401
+    QEffMptAttention,
+    QEffMptBlock,
+    QEffMptForCausalLM,
+    QEFfMptModel,
+)

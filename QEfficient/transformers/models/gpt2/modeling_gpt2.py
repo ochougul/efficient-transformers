@@ -17,6 +17,7 @@ from QEfficient.transformers.modeling_outputs import (
     QEffCausalLMOutputWithCrossAttentions,
 )
 
+__all__ = ["QEffGPT2Attention", "QEffGPT2Block", "QEffGPT2LMHeadModel", "QEffGPT2Model"]
 
 class QEffGPT2LMHeadModel(GPT2LMHeadModel):
     """

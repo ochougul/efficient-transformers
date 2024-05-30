@@ -6,45 +6,13 @@
 # -----------------------------------------------------------------------------
 
 import hashlib
-from collections import namedtuple
 
 import torch.nn as nn
 import transformers
-from transformers.models.codegen.modeling_codegen import (
-    CodeGenAttention,
-    CodeGenBlock,
-    CodeGenForCausalLM,
-    CodeGenModel,
-)
-from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, GPT2Block, GPT2LMHeadModel, GPT2Model
-from transformers.models.llama.modeling_llama import (
-    LlamaAttention,
-    LlamaDecoderLayer,
-    LlamaForCausalLM,
-    LlamaModel,
-    LlamaRMSNorm,
-)
-from transformers.models.mistral.modeling_mistral import (
-    MistralAttention,
-    MistralDecoderLayer,
-    MistralForCausalLM,
-    MistralModel,
-    MistralRMSNorm,
-    MistralRotaryEmbedding,
-)
-from transformers.models.mixtral.modeling_mixtral import (
-    MixtralAttention,
-    MixtralForCausalLM,
-    MixtralModel,
-    MixtralDecoderLayer,
-    MixtralSparseMoeBlock,
-    MixtralBLockSparseTop2MLP,
-    MixtralRotaryEmbedding,
-    MixtralRMSNorm,
-)
-from transformers.models.mpt.modeling_mpt import MptAttention, MptBlock, MptForCausalLM, MptModel
 
-from QEfficient.customop import CustomRMSNormAIC
+from QEfficient.transformers.models.mapper import TransformersToQEffModulesDict
+import ipdb
+ipdb.set_trace()
 from QEfficient.utils.logging_utils import logger
 
 from .modeling_attn_mask_utils import (
@@ -60,93 +28,6 @@ from .modeling_outputs import (
     QEffMoeCausalLMOutputWithPast,
     QEffMoeModelOutputWithPast,
 )
-from .models.codegen.modeling_codegen import (
-    QEffCodeGenAttention,
-    QEffCodeGenBlock,
-    QEffCodeGenForCausalLM,
-    QEffCodeGenModel,
-)
-from .models.gpt2.modeling_gpt2 import QEffGPT2Attention, QEffGPT2Block, QEffGPT2LMHeadModel, QEffGPT2Model
-from .models.llama.modeling_llama import (
-    QEffLlamaAttention,
-    QEffLlamaDecoderLayer,
-    QEffLlamaForCausalLM,
-    QEffLlamaModel,
-)
-from .models.mistral.modeling_mistral import (
-    QEffMistralAttention,
-    QEffMistralDecoderLayer,
-    QEffMistralForCausalLM,
-    QEffMistralModel,
-    QEffMistralRotaryEmbedding,
-)
-from .models.mixtral_moe.modeling_mixtral import (
-    QEffMixtralModel,
-    QEffMixtralRotaryEmbedding,
-    QEffMixtralAttention,
-    QEffMixtralForCausalLM,
-    QEffMixtralDecoderLayer,
-    QEffMixtralSparseMoeBlock,
-    QEffMixtralBLockSparseTop2MLP,
-)
-from .models.mpt.modeling_mpt import QEffMptAttention, QEffMptBlock, QEffMptForCausalLM, QEFfMptModel
-
-# Define a named tuple for ModelArchitectures
-# Required for the Automation tool
-ModelArchitectures = namedtuple("ModelArchitectures", ["architectures"])
-# Create an instance of the named tuple
-my_architectures = ModelArchitectures(
-    [
-        GPT2LMHeadModel.__name__,
-        MptForCausalLM.__name__,
-        CodeGenForCausalLM.__name__,
-        LlamaForCausalLM.__name__,
-        MistralForCausalLM.__name__,
-        MixtralForCausalLM.__name__,
-    ]
-)
-
-# Define a transformers layers to QEff layers dictionary
-# While onboarding new models make sure to add the new layer maps to this dictionary.
-TransformersToQEffModulesDict = {
-    # GPT model layers
-    GPT2Model: QEffGPT2Model,
-    GPT2Block: QEffGPT2Block,
-    GPT2Attention: QEffGPT2Attention,
-    GPT2LMHeadModel: QEffGPT2LMHeadModel,
-    # Llama model layers
-    LlamaModel: QEffLlamaModel,
-    LlamaAttention: QEffLlamaAttention,
-    LlamaForCausalLM: QEffLlamaForCausalLM,
-    LlamaDecoderLayer: QEffLlamaDecoderLayer,
-    LlamaRMSNorm: CustomRMSNormAIC,
-    # MPT model layers
-    MptAttention: QEffMptAttention,
-    MptBlock: QEffMptBlock,
-    MptModel: QEFfMptModel,
-    MptForCausalLM: QEffMptForCausalLM,
-    # CodeGen model layers
-    CodeGenAttention: QEffCodeGenAttention,
-    CodeGenBlock: QEffCodeGenBlock,
-    CodeGenModel: QEffCodeGenModel,
-    CodeGenForCausalLM: QEffCodeGenForCausalLM,
-    # Mistral model layers
-    MistralAttention: QEffMistralAttention,
-    MistralModel: QEffMistralModel,
-    MistralDecoderLayer: QEffMistralDecoderLayer,
-    MistralForCausalLM: QEffMistralForCausalLM,
-    MistralRotaryEmbedding: QEffMistralRotaryEmbedding,
-    MistralRMSNorm: CustomRMSNormAIC,
-    # Mixtral model layers
-    MixtralAttention: QEffMixtralAttention,
-    MixtralModel: QEffMixtralModel,
-    MixtralDecoderLayer: QEffMixtralDecoderLayer,
-    MixtralForCausalLM: QEffMixtralForCausalLM,
-    MixtralRotaryEmbedding: QEffMixtralRotaryEmbedding,
-    MixtralRMSNorm: CustomRMSNormAIC,
-    MixtralSparseMoeBlock: QEffMixtralSparseMoeBlock,
-    MixtralBLockSparseTop2MLP:QEffMixtralBLockSparseTop2MLP,
-}
 
 
 def get_params_hash(model: nn.Module) -> str:
