@@ -97,7 +97,7 @@ class CompressWeight(object):
         scale_zeros = zeros * scales
         scale_mat = scales[g_idx]
         scale_zeros_mat = scale_zeros[g_idx]
-        intweight_T = torch.round((weight + scale_zeros_mat) / scale_mat).to(torch.int)
+        intweight_T = torch.round(((weight + scale_zeros_mat) / scale_mat).float()).to(torch.int)
         return intweight_T
 
     def _dequant_weight(self, intweight, scales, zeros, g_idx):
@@ -117,7 +117,7 @@ class CompressWeight(object):
         return self._dequant_weight(q_weight.T, scales.T, zeros.T, g_idx).T
 
     def unpack(self):
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cpu"
         qzeros = self.qzeros.to(device)
         qweight = self.qweight.to(device)
         weight_dim0 = self.infeatures
@@ -243,3 +243,62 @@ class CompressWeight(object):
         zeros = zeros.to(device)
         layer_weight = linear.weight.data.to(device)
         return self.accelerate_pack_on_device(layer_weight, scales, zeros, g_idx, device)
+
+
+def reverse_reorder_int_tensor(int_tensor):
+    int_tensor = int_tensor.T.contiguous()
+    compress_ratio = (32 // 4)
+    assert int_tensor.shape[-1] % compress_ratio == 0
+    order_map = [0, 2, 4, 6, 1, 3, 5, 7]
+    order_tensor = torch.tensor(
+        order_map, dtype=torch.int32, device=int_tensor.device).reshape(1, -1)
+    order_tensor = order_tensor.repeat(
+        int_tensor.shape[1] // compress_ratio, 1)
+    order_tensor = order_tensor + torch.arange(0, int_tensor.shape[1],
+                                                compress_ratio, dtype=torch.int32, device=int_tensor.device).reshape(-1, 1)
+    order_tensor = order_tensor.reshape(-1)
+
+    reverse_order_tensor = torch.arange(order_tensor.shape[0]).to(int_tensor.device)[order_tensor]
+    reverse_order_tensor = reverse_order_tensor[order_tensor]
+    int_tensor = int_tensor[:, reverse_order_tensor]
+    return int_tensor
+
+
+def dequant_weight(intweight, scales, zeros, g_idx):
+    scale_zeros = zeros * scales
+    scale_mat = scales[g_idx]
+    scale_zeros_mat = scale_zeros[g_idx]
+    qdq_weight_T = intweight * scale_mat - scale_zeros_mat.half()
+
+    return qdq_weight_T
+
+
+def unpack_wqlinear_gemm(layer):
+    device = "cpu"
+    qzeros = layer.qzeros.to(device)
+    qweight = layer.qweight.to(device)
+    weight_dim0 = layer.in_features
+
+    qweight = qweight.T.contiguous()
+    weight_dim0 = layer.out_features
+    scales = layer.scales.to(device)
+
+    weight = torch.zeros((weight_dim0, qweight.shape[1]), dtype=torch.int32, device=qweight.device)
+    zeros = torch.zeros((layer.in_features // layer.group_size, layer.out_features), dtype=torch.int32, device=qweight.device)
+    general_unpack_on_row(qweight, weight, layer.w_bit)
+    general_unpack_on_row(qzeros, zeros, layer.w_bit)
+
+
+    zeros = zeros.T.contiguous()
+    zeros = reverse_reorder_int_tensor(zeros)
+    weight = reverse_reorder_int_tensor(weight)
+
+    fp16_weight = dequant_weight(weight, scales, zeros, torch.tensor([i // layer.group_size for i in range(layer.in_features)], dtype=torch.int32)).T
+    # free memory
+    weight = weight.to("cpu", non_blocking=True)
+    # weight = (scales * (weight - zeros))
+    # weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
+    fp16_weight = fp16_weight.to("cpu", non_blocking=True)
+    zeros = zeros.to("cpu", non_blocking=True)
+    scales = scales.to("cpu", non_blocking=True)
+    return (fp16_weight, scales, zeros)

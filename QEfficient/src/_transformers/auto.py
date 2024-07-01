@@ -27,9 +27,6 @@ class QEFFTransformersBase(QEFFBaseModel):
     Parent class for models QEFF provides from transformers i.e. (AutoModel, AutoModelForCausalLM, AutoModelForAudioClassification etc.) from src/transformers/models/auto/modeling_auto.py file.
     """
     def __init__(self, model: nn.Module, transform:bool = True) -> None:
-        assert (model.__class__ in MODEL_FOR_CAUSAL_LM_MAPPING.values() or
-                # FIXME: Use model architectures here instead of complete dictionary TransformersToQEffModulesDict
-                model.__class__ in TransformersToQEffModulesDict.values()), f"Given model{model.__class__.__name__} could not be found in transformers library i.e. {MODEL_FOR_CAUSAL_LM_MAPPING.values()}" # type: ignore
         self.model: nn.Module = model
         if transform:
             self.transform()

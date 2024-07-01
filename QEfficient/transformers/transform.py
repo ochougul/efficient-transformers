@@ -92,7 +92,7 @@ def transform(model: QEFFBaseModel, form_factor="cloud"):
     """
     assert form_factor == "cloud", "Only form_factor='cloud' is supported as of now!"
     # FIXME: move this to class and use model.transform()
-    if AUTO_MODEL_MAP_TO_MODEL_TYPE_MAP.get(model.__class__, None) == QEFF_MODEL_TYPE.CAUSALLM:
+    if AUTO_MODEL_MAP_TO_MODEL_TYPE_MAP.get(model.__class__, None) in [QEFF_MODEL_TYPE.CAUSALLM, QEFF_MODEL_TYPE.AWQ]:
         transform_lm(model.model)  # type: ignore
         return model
     else:

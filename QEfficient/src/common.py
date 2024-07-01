@@ -23,7 +23,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
 from QEfficient.src._transformers.auto import QEFFAutoModelForCausalLM
 from QEfficient.src.base import QEFFBaseModel
 from QEfficient.utils._utils import login_and_download_hf_lm
-
+from QEfficient.src._quant.awq import QEFFAWQModelForCausalLM
 
 class QEFF_MODEL_TYPE(Enum):
     """
@@ -35,7 +35,8 @@ class QEFF_MODEL_TYPE(Enum):
 
 
 MODEL_TYPE_TO_QEFF_AUTO_MODEL_MAP: Dict[QEFF_MODEL_TYPE, Type[QEFFBaseModel]] = {
-    QEFF_MODEL_TYPE.CAUSALLM: QEFFAutoModelForCausalLM
+    QEFF_MODEL_TYPE.CAUSALLM: QEFFAutoModelForCausalLM,
+    QEFF_MODEL_TYPE.AWQ: QEFFAWQModelForCausalLM
 }
 
 AUTO_MODEL_MAP_TO_MODEL_TYPE_MAP: Dict[Type[QEFFBaseModel], QEFF_MODEL_TYPE] = {v:k for k,v in MODEL_TYPE_TO_QEFF_AUTO_MODEL_MAP.items()}

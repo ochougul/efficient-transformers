@@ -10,9 +10,10 @@ import json
 import os
 from dataclasses import dataclass
 
+import torch
 import torch.nn as nn
-from transformers import AutoConfig
 import tqdm
+from transformers import AutoConfig
 
 from QEfficient.src._transformers.auto import QEFFAutoModelForCausalLM
 
@@ -69,20 +70,20 @@ def set_op_by_name(layer, name, new_module):
 
 def repack_transform(model: nn.Module):
     from awq.modules.linear import WQLinear_GEMM
-    from QEfficient.src._quant.quant_linear_onnxruntime import QuantLinearORT, CompressWeight
-    WQLinear_GEMM.unpack = CompressWeight.unpack
+    from QEfficient.src._quant.quant_linear_onnxruntime import QuantLinearORT
+    from QEfficient.src._quant.compress_weight import unpack_wqlinear_gemm
     source_layer = WQLinear_GEMM
     target_layer = QuantLinearORT
     qlayers = find_layers(model, [source_layer])
 
     for module_name, qlayer in tqdm.tqdm(qlayers.items(),
             desc="repacking model from pack_mode=`GEMM` to `ORT`"):
-        fp16_weight, scales, zeros = qlayer.unpack()
+        fp16_weight, scales, zeros = unpack_wqlinear_gemm(qlayer)
         qlayer.weight = fp16_weight
         tmp = qlayer
-        new_module = target_layer(model.quant_config.bits, model.quant_config.groupsize, tmp.infeatures, tmp.outfeatures, tmp.bias is not None)
+        new_module = target_layer(tmp.w_bit,tmp.group_size, tmp.in_features, tmp.out_features, tmp.bias is not None)
         set_op_by_name(model, module_name, new_module)
-        new_module.pack(tmp, scales.T, zeros.T, tmp.g_idx)
+        new_module.pack(tmp, scales.T, zeros.T, torch.tensor([i // tmp.group_size for i in range(tmp.in_features)], dtype=torch.int32))
         qlayer.to('cpu')
         new_module.to('cpu')
     del qlayers
@@ -104,7 +105,7 @@ class QEFFAWQModelForCausalLM(QEFFAutoModelForCausalLM):
         """
         from awq import AutoAWQForCausalLM
         check_if_awq_model_is_supported(pretrained_model_name_or_path, **kwargs)
-        model_with_replaced_linear_layers = AutoAWQForCausalLM.from_quantized(pretrained_model_name_or_path, **kwargs)
+        model_with_replaced_linear_layers = AutoAWQForCausalLM.from_quantized(pretrained_model_name_or_path, fuse_layers=False, **kwargs)
         import ipdb
         ipdb.set_trace()
         repack_transform(model_with_replaced_linear_layers)
