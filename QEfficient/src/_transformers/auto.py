@@ -42,7 +42,7 @@ class QEFFTransformersBase(QEFFBaseModel):
         return getattr(self.model, "qeff_transformed", False)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, *args, **kwargs):
+    def from_quantized(cls, pretrained_model_name_or_path: str, *args, **kwargs):
         """
         This method accepts All the parameters that are acceptable by transformers.AutoModelForCausalLM.
         There are few additional parameters that this method can take:

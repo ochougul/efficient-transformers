@@ -5,9 +5,14 @@
 #
 # -----------------------------------------------------------------------------
 
+import gc
 import json
 import os
 from dataclasses import dataclass
+
+import torch.nn as nn
+from transformers import AutoConfig
+import tqdm
 
 from QEfficient.src._transformers.auto import QEFFAutoModelForCausalLM
 
@@ -30,11 +35,64 @@ def get_quant_config_from_pretrained_model_path(pretrained_model_path: str):
         return quant_config
     
 
+def check_if_awq_model_is_supported(pretrained_model_name_or_path, **kwargs):
+    if kwargs.get("force_download", None) is None:
+        kwargs.update({"force_download": False})
+    config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
+    quant_config = getattr(config, "quantization_config", getattr(config, "quant_config", None))
+    assert quant_config is not None, "Expected quantization config to be present in config.json"
+    assert quant_config.get("version", None).lower() == "gemm", f"Only gemm version AWQ models is supported as of now got {quant_config.version}"
+
+
+def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):  # noqa:B006
+    if type(module) in layers:
+        return {name: module}
+    res = {}
+    for name1, child in module.named_children():
+        res.update(find_layers(child, layers=layers, name=name + '.' + name1 if name != '' else name1))
+    return res
+
+
+def set_op_by_name(layer, name, new_module):
+    levels = name.split('.')
+    if len(levels) > 1:
+        mod_ = layer
+        for l_idx in range(len(levels)-1):
+            if levels[l_idx].isdigit():  # noqa:SIM108
+                mod_ = mod_[int(levels[l_idx])]
+            else:
+                mod_ = getattr(mod_, levels[l_idx])
+        setattr(mod_, levels[-1], new_module)
+    else:
+        setattr(layer, name, new_module)
+
+
+def repack_transform(model: nn.Module):
+    from awq.modules.linear import WQLinear_GEMM
+    from QEfficient.src._quant.quant_linear_onnxruntime import QuantLinearORT, CompressWeight
+    WQLinear_GEMM.unpack = CompressWeight.unpack
+    source_layer = WQLinear_GEMM
+    target_layer = QuantLinearORT
+    qlayers = find_layers(model, [source_layer])
+
+    for module_name, qlayer in tqdm.tqdm(qlayers.items(),
+            desc="repacking model from pack_mode=`GEMM` to `ORT`"):
+        fp16_weight, scales, zeros = qlayer.unpack()
+        qlayer.weight = fp16_weight
+        tmp = qlayer
+        new_module = target_layer(model.quant_config.bits, model.quant_config.groupsize, tmp.infeatures, tmp.outfeatures, tmp.bias is not None)
+        set_op_by_name(model, module_name, new_module)
+        new_module.pack(tmp, scales.T, zeros.T, tmp.g_idx)
+        qlayer.to('cpu')
+        new_module.to('cpu')
+    del qlayers
+    gc.collect()
+    return model
+
+
 class QEFFAWQModelForCausalLM(QEFFAutoModelForCausalLM):
-    def from_pretrained(self, pretrained_model_name_or_path: str, *args, **kwargs):
-        transform: bool = kwargs.get("transform", True)
-        kwargs.update({"use_cache": True})  # Always pass use_cache = True, to get KV values as output during ONNX export 
-        
+    @classmethod
+    def from_quantized(cls, pretrained_model_name_or_path: str, /,  **kwargs):
         """
         Make sure that awq package should not be required if user doesn't want to load any AWQ model, so keep import statements within this.
         1. Load the model weights autoAWQ style instead of qllm style
@@ -42,5 +100,12 @@ class QEFFAWQModelForCausalLM(QEFFAutoModelForCausalLM):
         3. load quantized modules autoAWQ style
         4. repack the weights qllm style
         5. return
+        FIXME: IT is possible to add from_quantized method in QEFFAutoModelForCausalLM -> think if that's a better option?
         """
-        pass
+        from awq import AutoAWQForCausalLM
+        check_if_awq_model_is_supported(pretrained_model_name_or_path, **kwargs)
+        model_with_replaced_linear_layers = AutoAWQForCausalLM.from_quantized(pretrained_model_name_or_path, **kwargs)
+        import ipdb
+        ipdb.set_trace()
+        repack_transform(model_with_replaced_linear_layers)
+        return cls(model_with_replaced_linear_layers)

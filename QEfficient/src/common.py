@@ -51,7 +51,7 @@ def check_if_model_is_awq(config) -> bool:
     if quant_config is None:
         return False  # Model is not quantized
     
-    if quant_config.get("quant_method", None) == "awq":
+    if quant_config.get("quant_method", quant_config.get("method", None)) == "awq":
         return True  # Only AWQ is supported as of now.
     else:
         raise NotImplementedError(f"current model type is not yet supported {type(config)}")
@@ -65,6 +65,7 @@ def get_hf_model_type(hf_model_path: str) -> QEFF_MODEL_TYPE:
     config, kwargs = AutoConfig.from_pretrained(
                 hf_model_path,
                 return_unused_kwargs=True,
+                force_download=False
             )
     assert config.__class__ in MODEL_FOR_CAUSAL_LM_MAPPING, f"Could not find {type(config.__class__)} in {MODEL_FOR_CAUSAL_LM_MAPPING.keys()} for transformers=={transformers.__version__}"
     
@@ -99,4 +100,4 @@ class QEFFCommonLoader:
         assert issubclass(qeff_auto_model_class, QEFFBaseModel), f"Expected class that inherits {QEFFBaseModel}, got {type(qeff_auto_model_class)}"
         
         # Initialize QEFF model class
-        return qeff_auto_model_class.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path)
+        return qeff_auto_model_class.from_quantized(pretrained_model_name_or_path=pretrained_model_name_or_path)
