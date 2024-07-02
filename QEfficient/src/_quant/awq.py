@@ -8,7 +8,6 @@
 import gc
 import json
 import os
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -16,11 +15,6 @@ import tqdm
 from transformers import AutoConfig
 
 from QEfficient.src._transformers.auto import QEFFAutoModelForCausalLM
-
-
-@dataclass
-class AWQQuantConfig:
-    pass
 
 
 def get_quant_config_from_pretrained_model_path(pretrained_model_path: str):
@@ -84,8 +78,7 @@ def repack_transform(model: nn.Module):
         new_module = target_layer(tmp.w_bit,tmp.group_size, tmp.in_features, tmp.out_features, tmp.bias is not None)
         set_op_by_name(model, module_name, new_module)
         new_module.pack(tmp, scales.T, zeros.T, torch.tensor([i // tmp.group_size for i in range(tmp.in_features)], dtype=torch.int32))
-        qlayer.to('cpu')
-        new_module.to('cpu')
+
     del qlayers
     gc.collect()
     return model

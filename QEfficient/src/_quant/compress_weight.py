@@ -1,10 +1,6 @@
-import torch
-import math
 import os
 
-
-def lcm(a: int, b: int):
-    return int(a * b / math.gcd(a, b))
+import torch
 
 
 def pack_on_row_fast_248bit(pack_tensor, ori_int_tensor, bits):
@@ -139,8 +135,6 @@ class CompressWeight(object):
         fp16_weight = self._dequant_weight(weight, scales, zeros, self.g_idx.to(device)).T
         # free memory
         weight = weight.to("cpu", non_blocking=True)
-        # weight = (scales * (weight - zeros))
-        # weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
         fp16_weight = fp16_weight.to("cpu", non_blocking=True)
         zeros = zeros.to("cpu", non_blocking=True)
         scales = scales.to("cpu", non_blocking=True)
@@ -296,8 +290,6 @@ def unpack_wqlinear_gemm(layer):
     fp16_weight = dequant_weight(weight, scales, zeros, torch.tensor([i // layer.group_size for i in range(layer.in_features)], dtype=torch.int32)).T
     # free memory
     weight = weight.to("cpu", non_blocking=True)
-    # weight = (scales * (weight - zeros))
-    # weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
     fp16_weight = fp16_weight.to("cpu", non_blocking=True)
     zeros = zeros.to("cpu", non_blocking=True)
     scales = scales.to("cpu", non_blocking=True)
