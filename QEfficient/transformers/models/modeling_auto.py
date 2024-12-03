@@ -295,7 +295,6 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
             for i in range(self.num_layers):
                 for kv in ["key", "value"]:
                     custom_io[f"past_{kv}.{i}{suffix}"] = kv_cache_dtype
-
         return self._compile(
             onnx_path,
             compile_dir,
