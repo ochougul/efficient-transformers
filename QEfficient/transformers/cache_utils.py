@@ -59,6 +59,9 @@ class QEffDynamicCache(DynamicCache):
         Return:
             A tuple containing the updated key and value states.
         """
+        import ipdb
+
+        ipdb.set_trace()
         # Update the cache
         if len(self.key_cache) <= layer_idx:
             self.key_cache.append(key_states)

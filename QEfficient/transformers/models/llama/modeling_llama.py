@@ -169,6 +169,8 @@ class QEffLlamaAttention(LlamaAttention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_read_indices: Optional[torch.LongTensor] = None,
+        kv_write_indices: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
@@ -198,7 +200,9 @@ class QEffLlamaAttention(LlamaAttention):
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        import ipdb
 
+        ipdb.set_trace()
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             if self.layer_idx is None:
@@ -210,11 +214,19 @@ class QEffLlamaAttention(LlamaAttention):
             kv_seq_len = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
         query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "batch_index": batch_index, "position_ids": position_ids}
+            cache_kwargs = {
+                "sin": sin,
+                "cos": cos,
+                "batch_index": batch_index,
+                "position_ids": position_ids,
+                "kv_read_indices": kv_read_indices,
+                "kv_write_indices": kv_write_indices,
+            }
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -274,6 +286,8 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        kv_read_indices: Optional[torch.LongTensor] = None,
+        kv_write_indices: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -306,7 +320,9 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        import ipdb
 
+        ipdb.set_trace()
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -320,6 +336,8 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            kv_read_indices=kv_read_indices,
+            kv_write_indices=kv_write_indices,
             **kwargs,
         )
 
@@ -377,6 +395,8 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        kv_read_indices: Optional[torch.LongTensor] = None,
+        kv_write_indices: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -393,6 +413,9 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
+        import ipdb
+
+        ipdb.set_trace()
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -407,6 +430,8 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
+            kv_read_indices=kv_read_indices,
+            kv_write_indices=kv_write_indices,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -448,6 +473,8 @@ class QEffLlamaModel(LlamaModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        kv_read_indices: Optional[torch.LongTensor] = None,
+        kv_write_indices: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -467,7 +494,9 @@ class QEffLlamaModel(LlamaModel):
                 "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
             )
             use_cache = False
+        import ipdb
 
+        ipdb.set_trace()
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -532,6 +561,8 @@ class QEffLlamaModel(LlamaModel):
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
+                    kv_read_indices=kv_read_indices,
+                    kv_write_indices=kv_write_indices,
                     **kwargs,
                 )
 

@@ -110,7 +110,9 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
     _pytorch_transforms = [AwqToMatmulNbitsTransform, GPTQToMatmulNbitsTransform, CustomOpsTransform, KVCacheTransform]
     _onnx_transforms = [FP16ClipTransform, SplitTensorsTransform]
 
-    def __init__(self, model: nn.Module, continuous_batching: bool = False, **kwargs):
+    def __init__(
+        self, model: nn.Module, continuous_batching: bool = False, enable_prefix_caching: bool = False, **kwargs
+    ):
         if kwargs.pop("full_batch_size", None):
             continuous_batching = True
             warnings.warn(
@@ -123,9 +125,17 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         self.model.config.use_cache = True
         self.num_layers = model.config.num_hidden_layers
         self.continuous_batching = continuous_batching
+        self.enable_prefix_caching = enable_prefix_caching
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, continuous_batching: bool = False, *args, **kwargs):
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path,
+        continuous_batching: bool = False,
+        enable_prefix_caching: bool = False,
+        *args,
+        **kwargs,
+    ):
         """
         This method serves as the easiest entry point into using QEfficient. The interface is designed to be similar to transformers.AutoModelForCausalLM.
         Once the model is initialized, you can use other methods such as export, compile, and generate on the same object.
@@ -157,6 +167,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
 
         self = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         self.continuous_batching = continuous_batching
+        self.enable_prefix_caching = enable_prefix_caching
         return self
 
     @property
@@ -197,12 +208,16 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         }
         if len(kv_cache_shape) == 3:  # For GPTBigCode arch the pkv is 3d
             pkv_dynamic_axes = {
-                0: "full_batch_size" if self.continuous_batching else "batch_size",
+                0: "cache_size"
+                if self.enable_prefix_caching
+                else ("full_batch_size" if self.continuous_batching else "batch_size"),
                 1: "ctx_len",
             }
         else:  # pkv is 4d
             pkv_dynamic_axes = {
-                0: "full_batch_size" if self.continuous_batching else "batch_size",
+                0: "cache_size"
+                if self.enable_prefix_caching
+                else ("full_batch_size" if self.continuous_batching else "batch_size"),
                 2: "ctx_len",
             }
         output_names = ["logits"]
@@ -215,6 +230,13 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         if self.continuous_batching:
             example_inputs["batch_index"] = torch.arange(bs).view(bs, 1)
             dynamic_axes["batch_index"] = {0: "batch_size"}
+
+        if self.enable_prefix_caching:
+            example_inputs["kv_read_indices"] = torch.ones((bs, seq_len), dtype=torch.int64) * -1
+            dynamic_axes["kv_read_indices"] = {0: "full_batch_size" if self.continuous_batching else "batch_size"}
+            example_inputs["kv_write_indices"] = torch.arange(0, seq_len * bs).reshape(bs, -1)
+            # example_inputs['kv_write_indices'][]
+            dynamic_axes["kv_write_indices"] = {0: "full_batch_size" if self.continuous_batching else "batch_size"}
 
         return self._export(
             example_inputs,

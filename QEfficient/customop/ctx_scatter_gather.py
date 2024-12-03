@@ -41,6 +41,9 @@ class CtxScatterFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(data: torch.Tensor, position_ids: torch.Tensor, updates: torch.Tensor):
+        import ipdb
+
+        ipdb.set_trace()
         batch_idx = torch.arange(data.shape[0]).view(-1, 1, 1)
         head_idx = torch.arange(data.shape[1]).view(1, -1, 1)
         ctx_idx = position_ids.unsqueeze(1)
@@ -128,6 +131,9 @@ class CtxGatherFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(data: torch.Tensor, ctx_indices: torch.Tensor):
+        import ipdb
+
+        ipdb.set_trace()
         batch_indices = torch.arange(data.shape[0]).view(-1, 1, 1)
         head_indices = torch.arange(data.shape[1]).view(1, -1, 1)
         return data[batch_indices, head_indices, ctx_indices]
