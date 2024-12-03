@@ -206,6 +206,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
                 2: "ctx_len",
             }
         output_names = ["logits"]
+        kv_cache_shape[0] = fbs * 4
         for i in range(self.num_layers):
             for kv in ["key", "value"]:
                 example_inputs["past_key_values"][i].append(torch.zeros(kv_cache_shape, dtype=torch.float32))
@@ -232,6 +233,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         ctx_len: int = 128,
         batch_size: int = 1,
         full_batch_size: Optional[int] = None,
+        cache_size_multiplier: Optional[int] = None,
         num_devices: int = 1,
         num_cores: int = 16,  # FIXME: Make this mandatory arg
         mxfp6_matmul: bool = False,
@@ -264,10 +266,20 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         if self.continuous_batching:
             if full_batch_size is None:
                 raise TypeError("missing required argument: 'full_batch_size'")
-
+            full_cache_size = (full_batch_size * cache_size_multiplier) if cache_size_multiplier else full_batch_size
             specializations = [
-                {"full_batch_size": full_batch_size, "batch_size": 1, "seq_len": prefill_seq_len, "ctx_len": ctx_len},
-                {"full_batch_size": full_batch_size, "batch_size": full_batch_size, "seq_len": 1, "ctx_len": ctx_len},
+                {
+                    "full_batch_size": full_cache_size,
+                    "batch_size": 1,
+                    "seq_len": prefill_seq_len,
+                    "ctx_len": ctx_len,
+                },
+                {
+                    "full_batch_size": full_cache_size,
+                    "batch_size": full_batch_size,
+                    "seq_len": 1,
+                    "ctx_len": ctx_len,
+                },
             ]
         else:
             specializations = [
