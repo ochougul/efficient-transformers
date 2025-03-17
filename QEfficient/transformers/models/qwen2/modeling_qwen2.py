@@ -28,7 +28,6 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Model,
     Qwen2RotaryEmbedding,
     logger,
-    repeat_kv,
     rotate_half,
 )
 
@@ -154,6 +153,40 @@ def apply_qeff_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed.to(q.dtype), k_embed.to(k.dtype)
 
 
+def repeat_kv(
+    hidden_states: torch.Tensor, n_rep: int, num_key_value_heads, num_attention_heads, orig_kv_heads
+) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    rows_to_fill = num_attention_heads % (num_key_value_heads * n_rep)  # -> 8
+    if rows_to_fill != 0:
+        old_repeats = num_key_value_heads // orig_kv_heads  # -> 4
+        remaining_expansion_data = hidden_states[
+            :, [i for i in range(0, num_key_value_heads, old_repeats)], :, :
+        ]  # 1, 8
+        remaining_expansion_data = torch.repeat_interleave(
+            remaining_expansion_data, repeats=rows_to_fill // orig_kv_heads, dim=1
+        )  # 1x8
+
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    hidden_states = hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+    if rows_to_fill != 0:
+        tensors_to_cat = []
+        for k in range(rows_to_fill):
+            tensors_to_cat.extend(
+                [hidden_states[:, k * orig_kv_heads : (k + 1) * orig_kv_heads, :, :], remaining_expansion_data[k]]
+            )
+        hidden_states = torch.cat(tensors_to_cat, dim=1)
+
+    return hidden_states
+
+
 class QEffQwen2Attention(Qwen2Attention):
     """
     Copied from Qwen2Attention: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py
@@ -216,8 +249,20 @@ class QEffQwen2Attention(Qwen2Attention):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        key_states = repeat_kv(
+            key_states,
+            self.num_key_value_groups,
+            num_key_value_heads=self.num_key_value_heads,
+            num_attention_heads=self.num_heads,
+            orig_kv_heads=self.orig_kv_heads,
+        )
+        value_states = repeat_kv(
+            value_states,
+            self.num_key_value_groups,
+            num_key_value_heads=self.num_key_value_heads,
+            num_attention_heads=self.num_heads,
+            orig_kv_heads=self.orig_kv_heads,
+        )
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 

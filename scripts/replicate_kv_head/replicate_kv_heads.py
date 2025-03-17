@@ -53,6 +53,10 @@ def duplicate_weights_for_linear_layer(
         layer.weight.data = torch.repeat_interleave(
             layer.weight.data.view(orig_kv_heads, head_dim, hidden_size), repeat, 0
         ).view(new_kv_heads * head_dim, hidden_size)
+        if isinstance(layer.bias, torch.nn.Parameter):
+            layer.bias.data = torch.repeat_interleave(layer.bias.data.view(orig_kv_heads, head_dim), repeat, 0).view(
+                new_kv_heads * head_dim
+            )
 
 
 def main(args):
@@ -90,6 +94,7 @@ def main(args):
     # Update the model's attention layers with new key-value heads
     for block in model.model.layers:
         attn = block.self_attn
+        setattr(attn, "orig_kv_heads", orig_kv_heads)
         attn.num_key_value_heads = new_kv_heads
         attn.num_key_value_groups = block.self_attn.num_heads // new_kv_heads
         duplicate_weights_for_linear_layer(attn.k_proj, orig_kv_heads, repeat, attn.head_dim, attn.hidden_size)
