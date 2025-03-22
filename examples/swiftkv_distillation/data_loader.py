@@ -14,21 +14,14 @@
 # limitations under the License.
 
 import sys
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from datasets import Dataset
-from torch.utils.data import DataLoader
-from torch.utils.data import RandomSampler
+from datasets import Dataset, load_dataset
+from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
-from transformers import BatchEncoding
-from transformers import PreTrainedTokenizerBase
-from datasets import load_dataset
-
+from transformers import BatchEncoding, PreTrainedTokenizerBase
 
 IGNORE_INDEX = -100
 
@@ -82,9 +75,7 @@ def pad(
     if max_seq is not None:
         output_shape[dim_to_pad] = max_seq
     elif divisible_by is not None:
-        output_shape[dim_to_pad] = (
-            int(np.ceil(output_shape[dim_to_pad] / divisible_by)) * divisible_by
-        )
+        output_shape[dim_to_pad] = int(np.ceil(output_shape[dim_to_pad] / divisible_by)) * divisible_by
 
     # Create an output tensor filled with the padding value
     # TODO: Likely for 2D position ids, this does not work. Need to revisit.
@@ -133,14 +124,9 @@ class DataCollatorForCausalLM:
         #     torch.tensor(example["attention_mask"]) for example in instances
         # ]
         if "position_ids" in instances[0]:
-            position_ids = [
-                torch.tensor(example["position_ids"]) for example in instances
-            ]
+            position_ids = [torch.tensor(example["position_ids"]) for example in instances]
         else:
-            position_ids = [
-                torch.tensor(list(range(len(example["input_ids"]))))
-                for example in instances
-            ]
+            position_ids = [torch.tensor(list(range(len(example["input_ids"])))) for example in instances]
 
         input_ids = pad(input_ids, padding_value=self.tokenizer.pad_token_id)
         labels = pad(labels, padding_value=IGNORE_INDEX)
@@ -182,10 +168,9 @@ def packing_sft_dataset(
             data["labels"],
         )
 
-        if (
-            not always_max_length
-            and len(example["input_ids"]) + len(input_ids) > max_length
-        ) or len(example["input_ids"]) > max_length:
+        if (not always_max_length and len(example["input_ids"]) + len(input_ids) > max_length) or len(
+            example["input_ids"]
+        ) > max_length:
             for key in train_dataset.keys():
                 train_dataset[key].append(example[key])
 
@@ -229,11 +214,10 @@ def pack_dataset(dataset):
 #         ("post-load", pack_dataset),
 #     ]
 
+
 def process(dataset, tokenizer):
     if "messages" not in dataset.column_names:
-        raise ValueError(
-            "Dataset must have 'messages' column to tokenize for SFTDataFactory."
-        )
+        raise ValueError("Dataset must have 'messages' column to tokenize for SFTDataFactory.")
     dataset = dataset.select_columns(["messages"])
     # sft based tokenization,
     # we assume the messages are in the format of:
@@ -261,9 +245,7 @@ def tokenize_messages(
     tokenizer: PreTrainedTokenizerBase,
     mask_inputs: bool = True,
 ) -> BatchEncoding:
-    conversation_text = tokenizer.apply_chat_template(
-        conversation=messages, tokenize=False
-    )
+    conversation_text = tokenizer.apply_chat_template(conversation=messages, tokenize=False)
     conversation_ids = tokenizer(
         conversation_text,
         return_offsets_mapping=mask_inputs,
@@ -271,9 +253,7 @@ def tokenize_messages(
     )
 
     if mask_inputs:
-        assistant_ranges = get_assistant_start_end_indices(
-            messages, conversation_text
-        )
+        assistant_ranges = get_assistant_start_end_indices(messages, conversation_text)
         # _ = get_assistant_start_end_indices(messages, conversation_text)
         labels = get_masked_labels(conversation_ids, assistant_ranges)
         conversation_ids["labels"] = labels
@@ -286,9 +266,7 @@ def tokenize_messages(
 
 
 # this code is adpoted from https://github.com/huggingface/trl/issues/632 (user: Peter-Devine )
-def get_assistant_start_end_indices(
-    messages: List[Dict[str, str]], conversation_text: str
-) -> List[Tuple[int, int]]:
+def get_assistant_start_end_indices(messages: List[Dict[str, str]], conversation_text: str) -> List[Tuple[int, int]]:
     return_indices = []
     for message in messages:
         if message["role"] == "assistant":
@@ -300,9 +278,7 @@ def get_assistant_start_end_indices(
     return return_indices
 
 
-def get_masked_labels(
-    conversation_ids: BatchEncoding, assistant_ranges: List[Tuple[int, int]]
-) -> List[int]:
+def get_masked_labels(conversation_ids: BatchEncoding, assistant_ranges: List[Tuple[int, int]]) -> List[int]:
     pre_output = IGNORE_INDEX
     output = []
 
@@ -330,6 +306,7 @@ def get_masked_labels(
                 pre_output = IGNORE_INDEX
                 output.append(IGNORE_INDEX)
     return output
+
 
 def create_dataloader(dataset, tokenizer) -> DataLoader:
     return DataLoader(
