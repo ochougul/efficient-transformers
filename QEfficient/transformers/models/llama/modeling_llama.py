@@ -141,7 +141,7 @@ def qeff_apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed.to(q.dtype), k_embed.to(k.dtype)
 
 
-class QEffLlamaAttention(LlamaAttention):
+class QEffLlamaAttentionOnlyLastLayerOptimization(LlamaAttention):
     """
     Copied from LlamaForCausalLM: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
     The only differences are:
@@ -195,7 +195,13 @@ class QEffLlamaAttention(LlamaAttention):
             key_states = self.k_proj(hidden_states, **kwargs)
             value_states = self.v_proj(hidden_states, **kwargs)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        import ipdb
+
+        ipdb.set_trace()
+        last_pos_id = position_ids.to(torch.int32).argmax(1, keepdim=True)
+        last_query_hidden_states = query_states[torch.arange(bsz), last_pos_id, :]
+
+        query_states = last_query_hidden_states.view(bsz, 1, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
@@ -210,46 +216,76 @@ class QEffLlamaAttention(LlamaAttention):
             kv_seq_len = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
+        cos_K = cos[position_ids].unsqueeze(1)
+        sin_k = sin[position_ids].unsqueeze(1)
+        key_states = (key_states * cos_K) + (rotate_half(key_states) * sin_k)
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "batch_index": batch_index, "position_ids": position_ids}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        if batch_index is not None:
+            position_ids = position_ids[batch_index, position_ids.to(torch.int32).argmax(1)].unsqueeze(1)
+        else:
+            position_ids = position_ids[torch.arange(bsz), position_ids.to(torch.int32).argmax(1)].unsqueeze(1)
+        cos_q = cos[position_ids].unsqueeze(1)
+        sin_q = sin[position_ids].unsqueeze(1)
+        query_states = (query_states * cos_q) + (rotate_half(query_states) * sin_q)
+        # query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-
+        ####################################################################################################
+        # Prototype code for doing self_attn only on last valid pos idx query instead of whole query
+        # TODO: later move the KV calc and self_attn in two separate for loops for less data I/O -> Must do
+        ####################################################################################################
+        last_cuasal_mask = attention_mask[torch.arange(bsz), :, last_pos_id, :]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:  # no matter the length, we just slice it
-            attn_weights = torch.where(attention_mask, torch.tensor(-10000.0, dtype=torch.float32), attn_weights)
-
-        # upcast attention to fp32
+        attn_weights = torch.where(last_cuasal_mask, torch.tensor(-10000.0, dtype=torch.float32), attn_weights)
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        if attn_output.size() != (bsz, self.num_heads, 1, self.head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f"`attn_output` should be of size {(bsz, self.num_heads, 1, self.head_dim)}, but is"
                 f" {attn_output.size()}"
             )
-
         attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, 1, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+        #########################
+        # VANILLA Implementation
+        #########################
+        # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        attn_output = attn_output.reshape(bsz, q_len, -1)
+        # if attention_mask is not None:  # no matter the length, we just slice it
+        #     attn_weights = torch.where(attention_mask, torch.tensor(-10000.0, dtype=torch.float32), attn_weights)
 
-        if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
-            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
-        else:
-            attn_output = self.o_proj(attn_output, **kwargs)
+        # # upcast attention to fp32
+        # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        # attn_output = torch.matmul(attn_weights, value_states)
 
-        if not output_attentions:
-            attn_weights = None
+        # if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        #     raise ValueError(
+        #         f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+        #         f" {attn_output.size()}"
+        #     )
 
+        # attn_output = attn_output.transpose(1, 2).contiguous()
+
+        # attn_output = attn_output.reshape(bsz, q_len, -1)
+
+        # if self.config.pretraining_tp > 1:
+        #     attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
+        #     o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
+        #     attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
+        # else:
+        #     attn_output = self.o_proj(attn_output, **kwargs)
+
+        # if not output_attentions:
+        #     attn_weights = None
+        #############################
+        # VANILLA Implementation END
+        #############################
         return attn_output, attn_weights, past_key_value
 
 
@@ -329,10 +365,13 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
             **kwargs,
         )
 
-        # Cast to INT32 to avoid issue while running in ONNXRT
-        logit_index = position_ids.to(torch.int32).argmax(1, keepdim=True)
-        hidden_states = outputs[0][torch.arange(position_ids.shape[0]).view(-1, 1), logit_index]
+        import ipdb
 
+        ipdb.set_trace()
+        # Cast to INT32 to avoid issue while running in ONNXRT
+        # logit_index = position_ids.to(torch.int32).argmax(1, keepdim=True)
+        # hidden_states = outputs[0][torch.arange(position_ids.shape[0]).view(-1, 1), logit_index]
+        hidden_states = outputs[0]
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
@@ -412,7 +451,6 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
-
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -426,10 +464,15 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
+        import ipdb
+
+        ipdb.set_trace()
+        last_pos_id = position_ids.to(torch.int32).argmax(1, keepdim=True)
+        bsz = hidden_states.shape[1]
+        residual[torch.arange(bsz), last_pos_id, :] += hidden_states
 
         # Fully Connected
-        residual = hidden_states
+        hidden_states = residual
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
