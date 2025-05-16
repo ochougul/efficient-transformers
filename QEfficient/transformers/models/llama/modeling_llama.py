@@ -25,7 +25,7 @@ from transformers.models.llama.modeling_llama import (
     rotate_half,
 )
 
-from QEfficient.transformers.cache_utils import QEffDynamicCache
+from QEfficient.transformers.cache_utils import HHCache
 from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
 
 
@@ -129,7 +129,7 @@ class QEffLlamaAttention(LlamaAttention):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        pkv_and_attn_scores: Optional[Cache] = None,
         batch_index: Optional[torch.LongTensor] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
@@ -149,14 +149,14 @@ class QEffLlamaAttention(LlamaAttention):
 
         kv_seq_len = key_states.shape[-2]
 
-        kv_seq_len = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        kv_seq_len = pkv_and_attn_scores.get_usable_length(kv_seq_len, self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        if past_key_value is not None:
+        if pkv_and_attn_scores is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "batch_index": batch_index, "position_ids": position_ids}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = pkv_and_attn_scores.update_kv(key_states, value_states, self.layer_idx, cache_kwargs)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -168,15 +168,15 @@ class QEffLlamaAttention(LlamaAttention):
 
         cache_kwargs = {"position_ids": position_ids}
         # Update KV Cache based on Heavy-Hitter Oracle
-        if past_key_value is not None:
-            past_key_value.update_slimming(attn_weights, self.num_key_value_groups, self.layer_idx, cache_kwargs)
+        if pkv_and_attn_scores is not None:
+            pkv_and_attn_scores.update_slimming(attn_weights, self.num_key_value_groups, self.layer_idx, cache_kwargs)
 
         attn_output = torch.matmul(attn_weights, value_states)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights, pkv_and_attn_scores
 
 
 class QEffLlamaDecoderLayer(LlamaDecoderLayer):
@@ -191,7 +191,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        pkv_and_attn_scores: Optional[Cache] = None,
         batch_index: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
@@ -207,7 +207,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            pkv_and_attn_scores=pkv_and_attn_scores,
             batch_index=batch_index,
             output_attentions=output_attentions,
             use_cache=use_cache,
@@ -244,7 +244,7 @@ class QEffLlamaModel(LlamaModel):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        pkv_and_attn_scores: Optional[Cache] = None,
         batch_index: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
@@ -268,18 +268,21 @@ class QEffLlamaModel(LlamaModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache):
+        if use_cache and not isinstance(pkv_and_attn_scores, Cache):
             return_legacy_cache = True
-            past_key_values = QEffDynamicCache.from_legacy_cache(past_key_values)
+            # TODO(h20): fix this
+            pkv_and_attn_scores = HHCache.from_legacy_cache(64, 32, pkv_and_attn_scores)
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            past_seen_tokens = pkv_and_attn_scores.get_seq_length() if pkv_and_attn_scores is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-
+        
+        kv_shape = pkv_and_attn_scores.key_cache[0].shape[-2]
+        position_ids = torch.where(position_ids.shape[-1] == 1 and position_ids.max() >= kv_shape-1, torch.tensor([[kv_shape-1]]), position_ids)
         causal_mask = _create_causal_mask(position_ids=position_ids, target_length=past_seen_tokens)
 
         # embed positions
@@ -297,7 +300,7 @@ class QEffLlamaModel(LlamaModel):
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_values,
+                pkv_and_attn_scores=pkv_and_attn_scores,
                 batch_index=batch_index,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
@@ -340,7 +343,7 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        pkv_and_attn_scores: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         batch_index: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -363,7 +366,7 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            pkv_and_attn_scores=pkv_and_attn_scores,
             batch_index=batch_index,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
