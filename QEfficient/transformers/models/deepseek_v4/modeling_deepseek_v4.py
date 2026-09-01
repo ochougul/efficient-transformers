@@ -32,8 +32,35 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 from QEfficient.customop.ctx_scatter_gather import CtxGatherFuncBlockedKV as CtxGatherBlockedKVFunc
 from QEfficient.customop.ctx_scatter_gather import CtxScatterFunc
 from QEfficient.customop.rms_norm import CustomRMSNormAIC, CustomRMSNormFunc
-from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
 from QEfficient.utils.constants import MIN_MASKED_ATTENTION_VALUE
+
+
+def _csa_cache_mode(config: DeepseekV4Config) -> str:
+    """Return the configured CSA retained-state layout, defaulting to ping-pong banks."""
+    mode = getattr(config, "csa_cache_mode", "ping_pong")
+    if mode not in ("overlap", "ping_pong"):
+        raise ValueError(f"Unsupported csa_cache_mode: {mode!r}")
+    return mode
+
+
+def _sliding_window_context_indices(
+    position_ids: torch.Tensor,
+    sliding_window: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fixed-width (== sliding_window) context indices ending at the current query's
+    last position, for reading back only the raw sliding window instead of the full
+    ctx_len-wide cache. The window is always the most recent `sliding_window` absolute
+    positions, so no wraparound/modular indexing is needed even though the underlying
+    buffer is allocated at ctx_len width. Returns (context_indices, valid): valid is
+    False for positions before decoding began (only relevant during the first
+    `sliding_window` decode steps).
+    """
+    context_end = position_ids[:, -1:].to(torch.int32).unsqueeze(1) + 1
+    offsets = torch.arange(sliding_window, device=device, dtype=torch.int32).view(1, 1, -1)
+    context_indices = offsets + context_end - sliding_window
+    valid = context_indices >= 0
+    return context_indices, valid
 
 
 class QEffSlidingCacheLayer(CacheLayerMixin):
@@ -121,12 +148,9 @@ class QEffSlidingCacheLayer(CacheLayerMixin):
         self.sliding_window_kv = CtxScatterFunc.apply(self.sliding_window_kv, position_ids, key_states)
         self.cumulative_length += key_states.shape[2]
 
-        context_length = (cache_kwargs or {}).get("context_length", self.max_cache_len)
-        context_indices = torch.arange(context_length, device=self.device, dtype=torch.int32).view(1, 1, -1)
-        context_end = position_ids[:, -1:].to(torch.int32).unsqueeze(1) + 1
-        context_indices = context_indices + context_end - context_length
+        context_indices, valid = _sliding_window_context_indices(position_ids, self.sliding_window, self.device)
         context_indices = context_indices.expand(-1, self.sliding_window_kv.shape[1], -1)
-        valid = context_indices >= 0
+        valid = valid.expand(-1, self.sliding_window_kv.shape[1], -1)
         invalid_index = torch.iinfo(torch.int32).max if torch.onnx.is_in_onnx_export() else 0
         gathered = CtxGatherBlockedKVFunc.apply(
             self.sliding_window_kv, torch.where(valid, context_indices, invalid_index)
@@ -315,11 +339,9 @@ class QEffHCACacheLayer(CacheLayerMixin):
             context_indices = context_indices.expand(self.max_batch_size, self.sliding_window_kv.shape[1], -1)
             valid = context_indices <= position_ids.max(dim=1, keepdim=True).values.to(torch.int32).unsqueeze(1)
         else:
-            context_indices = torch.arange(context_length, device=self.device, dtype=torch.int32).view(1, 1, -1)
-            context_end = position_ids[:, -1:].to(torch.int32).unsqueeze(1) + 1
-            context_indices = context_indices + context_end - context_length
+            context_indices, valid = _sliding_window_context_indices(position_ids, self.sliding_window, self.device)
             context_indices = context_indices.expand(-1, self.sliding_window_kv.shape[1], -1)
-            valid = context_indices >= 0
+            valid = valid.expand(-1, self.sliding_window_kv.shape[1], -1)
         invalid_index = torch.iinfo(torch.int32).max if torch.onnx.is_in_onnx_export() else 0
         gathered = CtxGatherBlockedKVFunc.apply(
             self.sliding_window_kv,
@@ -623,11 +645,9 @@ class QEffCSACacheLayer(CacheLayerMixin):
             context_indices = context_indices.expand(self.max_batch_size, self.sliding_window_kv.shape[1], -1)
             valid = context_indices <= position_ids.max(dim=1, keepdim=True).values.to(torch.int32).unsqueeze(1)
         else:
-            context_indices = torch.arange(context_length, device=self.device, dtype=torch.int32).view(1, 1, -1)
-            context_end = position_ids[:, -1:].to(torch.int32).unsqueeze(1) + 1
-            context_indices = context_indices + context_end - context_length
+            context_indices, valid = _sliding_window_context_indices(position_ids, self.sliding_window, self.device)
             context_indices = context_indices.expand(-1, self.sliding_window_kv.shape[1], -1)
-            valid = context_indices >= 0
+            valid = valid.expand(-1, self.sliding_window_kv.shape[1], -1)
         invalid_index = torch.iinfo(torch.int32).max if torch.onnx.is_in_onnx_export() else 0
         gathered = CtxGatherBlockedKVFunc.apply(
             self.sliding_window_kv, torch.where(valid, context_indices, invalid_index)
@@ -758,6 +778,254 @@ class QEffCSACacheLayer(CacheLayerMixin):
             "indexer_gate_buffer",
             "indexer_overlap_kv",
             "indexer_overlap_gate",
+            "actual_indexer_compressed_kv",
+        ):
+            setattr(self, name, getattr(self, name)[indices])
+
+
+class QEffCSAPingPongCacheLayer(CacheLayerMixin):
+    """Fixed-capacity retained state for one DeepSeek V4 CSA layer using two rolling banks."""
+
+    is_compileable = True
+    is_sliding = True
+
+    def __init__(
+        self,
+        config: DeepseekV4Config,
+        sliding_window_kv: torch.Tensor,
+        compressor_kv_buffer: torch.Tensor,
+        compressor_gate_buffer: torch.Tensor,
+        actual_compressed_kv: torch.Tensor,
+        indexer_kv_buffer: torch.Tensor,
+        indexer_gate_buffer: torch.Tensor,
+        actual_indexer_compressed_kv: torch.Tensor,
+        *,
+        cumulative_length: int = 0,
+        compressor_entry_count: int = 0,
+        indexer_entry_count: int = 0,
+    ) -> None:
+        self.sliding_window = config.sliding_window
+        self.compression_size = config.compress_rates["compressed_sparse_attention"]
+        self.sliding_window_kv = sliding_window_kv
+        self.compressor_kv_buffer = compressor_kv_buffer
+        self.compressor_gate_buffer = compressor_gate_buffer
+        self.actual_compressed_kv = actual_compressed_kv
+        self.indexer_kv_buffer = indexer_kv_buffer
+        self.indexer_gate_buffer = indexer_gate_buffer
+        self.actual_indexer_compressed_kv = actual_indexer_compressed_kv
+        self.cumulative_length = cumulative_length
+        self.compressor_entry_count = compressor_entry_count
+        self.indexer_entry_count = indexer_entry_count
+        self.max_cache_len = sliding_window_kv.shape[2]
+        self.is_initialized = True
+        self.device = sliding_window_kv.device
+        self.dtype = sliding_window_kv.dtype
+        self._validate_state(config)
+
+    def _validate_state(self, config: DeepseekV4Config) -> None:
+        batch = self.sliding_window_kv.shape[0]
+        capacity = (self.max_cache_len + self.compression_size - 1) // self.compression_size
+        common_prefix = (batch, 1)
+        expected = {
+            "sliding_window_kv": (batch, config.num_key_value_heads, self.max_cache_len, config.head_dim),
+            "compressor_kv_buffer": (*common_prefix, 2 * self.compression_size, 2 * config.head_dim),
+            "compressor_gate_buffer": (*common_prefix, 2 * self.compression_size, 2 * config.head_dim),
+            "actual_compressed_kv": (*common_prefix, capacity, config.head_dim),
+            "indexer_kv_buffer": (*common_prefix, 2 * self.compression_size, 2 * config.index_head_dim),
+            "indexer_gate_buffer": (*common_prefix, 2 * self.compression_size, 2 * config.index_head_dim),
+            "actual_indexer_compressed_kv": (*common_prefix, capacity, config.index_head_dim),
+        }
+        for name, shape in expected.items():
+            tensor = getattr(self, name)
+            if tuple(tensor.shape) != shape:
+                raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}.")
+            if tensor.device != self.device or tensor.dtype != self.dtype:
+                raise ValueError("All QEff CSA ping-pong cache tensors must have the same device and dtype.")
+        if not 0 <= self.cumulative_length <= self.max_cache_len:
+            raise ValueError("cumulative_length is outside the cache capacity.")
+
+    @property
+    def max_batch_size(self) -> int:
+        return self.sliding_window_kv.shape[0]
+
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        if key_states.shape[0] != self.max_batch_size or key_states.shape[-1] != self.sliding_window_kv.shape[-1]:
+            raise ValueError("KV initialization shape does not match the allocated QEff CSA ping-pong cache.")
+
+    def get_seq_length(self) -> int:
+        return self.cumulative_length
+
+    def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+        is_full = self.cumulative_length >= self.sliding_window
+        kv_offset = max(self.cumulative_length - self.sliding_window + 1, 0)
+        if is_full:
+            return self.sliding_window - 1 + query_length, kv_offset
+        return self.cumulative_length + query_length, kv_offset
+
+    def get_max_cache_shape(self) -> int:
+        return self.max_cache_len
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cache_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if key_states is not value_states and not torch.equal(key_states, value_states):
+            raise ValueError("QEffCSAPingPongCache requires shared K/V states.")
+        cache_kwargs = cache_kwargs or {}
+        position_ids = cache_kwargs.get("position_ids")
+        if position_ids is None:
+            raise ValueError("QEffCSAPingPongCache.update requires position_ids in cache_kwargs.")
+        if position_ids.shape != key_states.shape[:1] + key_states.shape[2:3]:
+            raise ValueError("position_ids must have shape [batch, query_length].")
+        if key_states.shape[0] != self.max_batch_size or key_states.shape[1] != self.sliding_window_kv.shape[1]:
+            raise ValueError("KV update batch/head dimensions do not match the allocated cache.")
+        if key_states.shape[-1] != self.sliding_window_kv.shape[-1]:
+            raise ValueError("KV update head_dim does not match the allocated cache.")
+        if not (torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()):
+            expected = position_ids[:, :1] + torch.arange(
+                position_ids.shape[1], device=position_ids.device, dtype=position_ids.dtype
+            )
+            if not torch.equal(position_ids, expected):
+                raise ValueError("QEffCSAPingPongCache requires contiguous position_ids within each batch row.")
+            expected_start = torch.full_like(position_ids[:, 0], self.cumulative_length)
+            if not torch.equal(position_ids[:, 0], expected_start):
+                raise ValueError("position_ids must begin at the cache's cumulative_length.")
+            if position_ids.numel() and (
+                position_ids.min().item() < 0 or position_ids.max().item() >= self.max_cache_len
+            ):
+                raise ValueError("position_ids exceed the allocated QEff CSA ping-pong cache capacity.")
+
+        scatter_positions = position_ids
+        self.sliding_window_kv = CtxScatterFunc.apply(self.sliding_window_kv, scatter_positions, key_states)
+        self.cumulative_length += key_states.shape[2]
+
+        bank = torch.remainder(torch.div(position_ids, self.compression_size, rounding_mode="floor"), 2)
+        buffer_positions = bank * self.compression_size + torch.remainder(position_ids, self.compression_size)
+        for prefix, expected_dim in (
+            ("compressor", self.compressor_kv_buffer.shape[-1]),
+            ("indexer", self.indexer_kv_buffer.shape[-1]),
+        ):
+            projected_kv = cache_kwargs.get(f"{prefix}_kv")
+            projected_gate = cache_kwargs.get(f"{prefix}_gate")
+            if (projected_kv is None) != (projected_gate is None):
+                raise ValueError(f"{prefix}_kv and {prefix}_gate must be provided together.")
+            if projected_kv is None:
+                continue
+            expected_shape = (self.max_batch_size, 1, expected_dim)
+            if tuple(projected_kv.shape) != expected_shape or projected_gate.shape != projected_kv.shape:
+                raise ValueError(f"Decode-only {prefix} projections must both have shape {expected_shape}.")
+            setattr(
+                self,
+                f"{prefix}_kv_buffer",
+                CtxScatterFunc.apply(getattr(self, f"{prefix}_kv_buffer"), buffer_positions, projected_kv.unsqueeze(1)),
+            )
+            setattr(
+                self,
+                f"{prefix}_gate_buffer",
+                CtxScatterFunc.apply(
+                    getattr(self, f"{prefix}_gate_buffer"), buffer_positions, projected_gate.unsqueeze(1)
+                ),
+            )
+
+        context_length = cache_kwargs.get("context_length")
+        if context_length is None:
+            context_indices = torch.arange(self.max_cache_len, device=self.device, dtype=torch.int32).view(1, 1, -1)
+            context_indices = context_indices.expand(self.max_batch_size, self.sliding_window_kv.shape[1], -1)
+            valid = context_indices <= position_ids.max(dim=1, keepdim=True).values.to(torch.int32).unsqueeze(1)
+        else:
+            context_indices, valid = _sliding_window_context_indices(position_ids, self.sliding_window, self.device)
+            context_indices = context_indices.expand(-1, self.sliding_window_kv.shape[1], -1)
+            valid = valid.expand(-1, self.sliding_window_kv.shape[1], -1)
+        invalid_index = torch.iinfo(torch.int32).max if torch.onnx.is_in_onnx_export() else 0
+        gathered = CtxGatherBlockedKVFunc.apply(
+            self.sliding_window_kv, torch.where(valid, context_indices, invalid_index)
+        )
+        gathered = torch.where(valid.unsqueeze(-1), gathered, torch.zeros_like(gathered))
+        return gathered, gathered
+
+    def update_csa_compressed_state(
+        self,
+        name: str,
+        compressed: torch.Tensor,
+        entry_positions: torch.Tensor,
+        write_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if name == "compressor":
+            compressed_attr = "actual_compressed_kv"
+            count_attr = "compressor_entry_count"
+        elif name == "indexer":
+            compressed_attr = "actual_indexer_compressed_kv"
+            count_attr = "indexer_entry_count"
+        else:
+            raise ValueError(f"Unsupported CSA compressor state: {name}")
+        setattr(
+            self,
+            compressed_attr,
+            CtxScatterFunc.apply(
+                getattr(self, compressed_attr),
+                entry_positions,
+                compressed.unsqueeze(1).unsqueeze(1),
+            ),
+        )
+        if not (torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()):
+            completed = entry_positions[write_mask.to(torch.bool)]
+            if completed.numel():
+                setattr(self, count_attr, max(getattr(self, count_attr), int(completed.max().item()) + 1))
+        return getattr(self, compressed_attr)
+
+    def reset(self) -> None:
+        for name in (
+            "sliding_window_kv",
+            "compressor_kv_buffer",
+            "compressor_gate_buffer",
+            "actual_compressed_kv",
+            "indexer_kv_buffer",
+            "indexer_gate_buffer",
+            "actual_indexer_compressed_kv",
+        ):
+            getattr(self, name).zero_()
+        self.cumulative_length = 0
+        self.compressor_entry_count = 0
+        self.indexer_entry_count = 0
+
+    def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        for name in (
+            "sliding_window_kv",
+            "compressor_kv_buffer",
+            "compressor_gate_buffer",
+            "actual_compressed_kv",
+            "indexer_kv_buffer",
+            "indexer_gate_buffer",
+            "actual_indexer_compressed_kv",
+        ):
+            setattr(self, name, getattr(self, name).index_select(0, beam_idx.to(self.device)))
+
+    def crop(self, max_length: int) -> None:
+        if max_length != self.cumulative_length:
+            raise NotImplementedError("QEffCSAPingPongCache does not support cropping fixed retained state.")
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        for name in (
+            "sliding_window_kv",
+            "compressor_kv_buffer",
+            "compressor_gate_buffer",
+            "actual_compressed_kv",
+            "indexer_kv_buffer",
+            "indexer_gate_buffer",
+            "actual_indexer_compressed_kv",
+        ):
+            setattr(self, name, getattr(self, name).repeat_interleave(repeats, dim=0))
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        for name in (
+            "sliding_window_kv",
+            "compressor_kv_buffer",
+            "compressor_gate_buffer",
+            "actual_compressed_kv",
+            "indexer_kv_buffer",
+            "indexer_gate_buffer",
             "actual_indexer_compressed_kv",
         ):
             setattr(self, name, getattr(self, name)[indices])
@@ -1056,7 +1324,7 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
                     write_mask,
                 )
 
-            if False:  # The model integration uses the validated CSA overlap retained-state layout.
+            if isinstance(layer, QEffCSAPingPongCacheLayer):
                 compressed_kv = build_csa_pingpong_compressed(
                     "compressor",
                     layer.compressor_kv_buffer,
@@ -1165,6 +1433,15 @@ class QEffDeepseekV4Cache(Cache):
         "indexer_overlap_gate",
         "actual_indexer_compressed_kv",
     )
+    _CSA_PINGPONG_STATE_NAMES = (
+        "sliding_window_kv",
+        "compressor_kv_buffer",
+        "compressor_gate_buffer",
+        "actual_compressed_kv",
+        "indexer_kv_buffer",
+        "indexer_gate_buffer",
+        "actual_indexer_compressed_kv",
+    )
 
     def __init__(self, layers: list[CacheLayerMixin]) -> None:
         super().__init__(layers=layers)
@@ -1204,19 +1481,32 @@ class QEffDeepseekV4Cache(Cache):
                     )
                 )
             elif layer_type == "compressed_sparse_attention":
-                if len(states) != len(cls._CSA_STATE_NAMES):
-                    raise ValueError("CSA cache layers require eleven retained-state tensors.")
                 ratio = config.compress_rates[layer_type]
                 entry_count = cumulative_length // ratio
-                layers.append(
-                    QEffCSACacheLayer(
-                        config,
-                        *states,
-                        cumulative_length=cumulative_length,
-                        compressor_entry_count=entry_count,
-                        indexer_entry_count=entry_count,
+                if _csa_cache_mode(config) == "ping_pong":
+                    if len(states) != len(cls._CSA_PINGPONG_STATE_NAMES):
+                        raise ValueError("CSA ping-pong cache layers require seven retained-state tensors.")
+                    layers.append(
+                        QEffCSAPingPongCacheLayer(
+                            config,
+                            *states,
+                            cumulative_length=cumulative_length,
+                            compressor_entry_count=entry_count,
+                            indexer_entry_count=entry_count,
+                        )
                     )
-                )
+                else:
+                    if len(states) != len(cls._CSA_STATE_NAMES):
+                        raise ValueError("CSA cache layers require eleven retained-state tensors.")
+                    layers.append(
+                        QEffCSACacheLayer(
+                            config,
+                            *states,
+                            cumulative_length=cumulative_length,
+                            compressor_entry_count=entry_count,
+                            indexer_entry_count=entry_count,
+                        )
+                    )
             else:
                 raise ValueError(f"Unsupported DeepSeek V4 attention layer type: {layer_type}")
         return cls(layers)
@@ -1228,6 +1518,8 @@ class QEffDeepseekV4Cache(Cache):
                 names = ("sliding_window_kv",)
             elif isinstance(layer, QEffHCACacheLayer):
                 names = self._HCA_STATE_NAMES
+            elif isinstance(layer, QEffCSAPingPongCacheLayer):
+                names = self._CSA_PINGPONG_STATE_NAMES
             elif isinstance(layer, QEffCSACacheLayer):
                 names = self._CSA_STATE_NAMES
             else:
@@ -1269,6 +1561,19 @@ class QEffDeepseekV4Cache(Cache):
                         torch.zeros(batch_size, 1, ratio, config.head_dim, **common),
                         torch.zeros(batch_size, 1, ratio, config.head_dim, **common),
                         torch.zeros(batch_size, 1, capacity, config.head_dim, **common),
+                    )
+                )
+                continue
+            if _csa_cache_mode(config) == "ping_pong":
+                layers.append(
+                    (
+                        sliding,
+                        torch.zeros(batch_size, 1, 2 * ratio, 2 * config.head_dim, **common),
+                        torch.zeros(batch_size, 1, 2 * ratio, 2 * config.head_dim, **common),
+                        torch.zeros(batch_size, 1, capacity, config.head_dim, **common),
+                        torch.zeros(batch_size, 1, 2 * ratio, 2 * config.index_head_dim, **common),
+                        torch.zeros(batch_size, 1, 2 * ratio, 2 * config.index_head_dim, **common),
+                        torch.zeros(batch_size, 1, capacity, config.index_head_dim, **common),
                     )
                 )
                 continue
@@ -1472,16 +1777,8 @@ class QEffDeepseekV4Model(DeepseekV4Model):
                 self.config, inputs_embeds.shape[0], ctx_len, inputs_embeds.dtype, inputs_embeds.device
             )
         cache = QEffDeepseekV4Cache.from_legacy_cache(self.config, past_key_values, position_ids)
-        ctx_len = cache.layers[0].max_cache_len
-        physical_position_ids = torch.full_like(position_ids, ctx_len - 1)
-        causal_mask = _create_causal_mask(
-            position_ids=physical_position_ids,
-            target_length=ctx_len,
-            sliding_window=self.config.sliding_window,
-        )
-        cache_indices = torch.arange(ctx_len, device=position_ids.device).view(1, 1, 1, -1)
-        uninitialized_prefix_mask = cache_indices < (ctx_len - position_ids - 1)[:, None, :, None]
-        causal_mask = causal_mask | uninitialized_prefix_mask
+        _, valid = _sliding_window_context_indices(position_ids, self.config.sliding_window, position_ids.device)
+        causal_mask = ~valid.unsqueeze(1)
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         position_embeddings = {
             "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
@@ -1537,7 +1834,11 @@ class QEffDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
         elif layer_type == "heavily_compressed_attention":
             state_names = QEffDeepseekV4Cache._HCA_STATE_NAMES
         elif layer_type == "compressed_sparse_attention":
-            state_names = QEffDeepseekV4Cache._CSA_STATE_NAMES
+            state_names = (
+                QEffDeepseekV4Cache._CSA_PINGPONG_STATE_NAMES
+                if _csa_cache_mode(self.config) == "ping_pong"
+                else QEffDeepseekV4Cache._CSA_STATE_NAMES
+            )
         else:
             raise ValueError(f"Unsupported DeepSeek V4 attention layer type: {layer_type}")
         if len(layer_state) != len(state_names):

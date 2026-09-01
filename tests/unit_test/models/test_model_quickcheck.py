@@ -200,6 +200,7 @@ def test_deepseek_v4_attention_uses_joint_softmax(layer_type, has_compressed_key
 @pytest.mark.parametrize(("name", "head_dim"), [("compressor", 8), ("indexer", 4)])
 def test_deepseek_v4_csa_overlap_updates_only_at_window_boundary(name, head_dim):
     config = _tiny_deepseek_v4_config()
+    config.csa_cache_mode = "overlap"
     legacy_cache = QEffDeepseekV4Cache.get_dummy_cache(config, batch_size=1, ctx_len=8, dtype=torch.float32)
     cache = QEffDeepseekV4Cache.from_legacy_cache(config, legacy_cache, torch.tensor([[0]]))
     layer = cache.layers[2]
@@ -242,6 +243,45 @@ def test_deepseek_v4_csa_overlap_updates_only_at_window_boundary(name, head_dim)
     torch.testing.assert_close(getattr(layer, f"{name}_overlap_gate"), chunk_gate[..., :head_dim].unsqueeze(1))
 
 
+@pytest.mark.parametrize("name", ["compressor", "indexer"])
+def test_deepseek_v4_csa_pingpong_updates_only_at_window_boundary(name):
+    config = _tiny_deepseek_v4_config()
+    legacy_cache = QEffDeepseekV4Cache.get_dummy_cache(config, batch_size=1, ctx_len=8, dtype=torch.float32)
+    cache = QEffDeepseekV4Cache.from_legacy_cache(config, legacy_cache, torch.tensor([[0]]))
+    layer = cache.layers[2]
+    assert type(layer).__name__ == "QEffCSAPingPongCacheLayer"
+
+    torch.manual_seed(0)
+    head_dim = config.head_dim if name == "compressor" else config.index_head_dim
+    compressed = torch.randn(1, head_dim)
+    entry_positions = torch.tensor([[0]])
+    compressed_attr = "actual_compressed_kv" if name == "compressor" else "actual_indexer_compressed_kv"
+    count_attr = "compressor_entry_count" if name == "compressor" else "indexer_entry_count"
+    expected_compressed = getattr(layer, compressed_attr).clone()
+
+    layer.update_csa_compressed_state(
+        name,
+        compressed,
+        entry_positions,
+        write_mask=torch.tensor([[False]]),
+    )
+
+    assert getattr(layer, count_attr) == 0
+    updated = getattr(layer, compressed_attr)
+    expected_compressed[:, 0, 0] = compressed
+    torch.testing.assert_close(updated, expected_compressed)
+
+    layer.update_csa_compressed_state(
+        name,
+        compressed,
+        entry_positions,
+        write_mask=torch.tensor([[True]]),
+    )
+
+    assert getattr(layer, count_attr) == 1
+    torch.testing.assert_close(getattr(layer, compressed_attr)[:, 0, 0], compressed)
+
+
 @pytest.mark.llm_model
 def test_deepseek_v4_three_layer_decode_parity():
     config = _tiny_deepseek_v4_config()
@@ -257,7 +297,7 @@ def test_deepseek_v4_three_layer_decode_parity():
 
     hf_cache = DynamicCache(config=config)
     qeff_cache = QEffDeepseekV4Cache.get_dummy_cache(config, batch_size=1, ctx_len=8, dtype=torch.float32)
-    assert [len(layer_state) for layer_state in qeff_cache] == [4, 4, 11]
+    assert [len(layer_state) for layer_state in qeff_cache] == [4, 4, 7]
 
     for position, token_id in enumerate((3, 7, 11, 5)):
         input_ids = torch.tensor([[token_id]])
