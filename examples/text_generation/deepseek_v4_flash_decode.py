@@ -95,6 +95,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ctx-len", type=int, default=512)
     parser.add_argument("--generation-len", type=int, default=250)
     parser.add_argument("--num-hidden-layers", type=int, default=43)
+    parser.add_argument(
+        "--csa-cache-mode",
+        choices=["ping_pong", "overlap"],
+        default="ping_pong",
+        help="CSA retained-state cache layout. Default: ping_pong.",
+    )
     parser.add_argument("--num-cores", type=int, default=12)
     parser.add_argument("--device-group", type=parse_device_group, default=[i for i in range(12)])
     parser.add_argument("--prefill-prompt", default=PREFILL_PROMPT)
@@ -113,6 +119,8 @@ def main() -> None:
         raise ValueError("num_hidden_layers must be at least 1.")
     if not args.device_group:
         raise ValueError("device_group must contain at least one QAIC device ID.")
+
+    args.artifact_root = args.artifact_root / args.csa_cache_mode
 
     os.environ["HF_HUB_CACHE"] = str(args.hf_cache)
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
@@ -139,6 +147,7 @@ def main() -> None:
     config.num_hidden_layers = args.num_hidden_layers
     config.layer_types = config.layer_types[: args.num_hidden_layers]
     config.mlp_layer_types = config.mlp_layer_types[: args.num_hidden_layers]
+    config.csa_cache_mode = args.csa_cache_mode
 
     hf_model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
