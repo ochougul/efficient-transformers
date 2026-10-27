@@ -21,7 +21,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +38,14 @@ NUM_CORES = 4
 BATCH_SIZE = 16
 DEFAULT_LAYERS = 4
 CONTEXT_LENGTH = 65_536
+OPSTATS_ITERATIONS = 30
+OPSTATS_PROFILE_START_ITER = 20
+OPSTATS_PROFILE_SAMPLES = 2
+OPSTATS_STATS_LEVEL = 70
+COMPILER_OPTS_UNSUPPORTED = (
+    "-aic-hoist-vtcm-loads=false -aic-op-stats-verbosity 2 "
+    "-aic-userdma-async=0 -aic-hmx-async=0 -aic-sync-ts-starts"
+)
 
 
 def _window_config_from_source(model_name_or_path: str | Path, layers: int):
@@ -72,7 +83,7 @@ def build_model(model_name_or_path: str | Path, checkpoint: Path | None, layers:
         "indexer_topk_blocking": 4,
         "sparse_q_block_size": 16,
         "sparse_kv_num_blocks": 8,
-        "num_cores_per_device": NUM_CORES,
+        "num_cores_per_device": num_cores,
         "ffn_blocking_mode": "token",
         "ffn_token_block_size": 4,
     }
@@ -85,7 +96,7 @@ def build_model(model_name_or_path: str | Path, checkpoint: Path | None, layers:
         config=config,
         qaic_config=qaic_config,
         weight_free=True,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float32,
     )
     model.model.eval()
     return model
@@ -95,7 +106,7 @@ def _load_window_config(snapshot: Path, layers: int):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from qwen4_exp_decode_parity import _window_config
 
-    return _window_config(snapshot, layers, CONTEXT_LENGTH, dtype="bfloat16")
+    return _window_config(snapshot, layers, CONTEXT_LENGTH, dtype="float32")
 
 
 class Qwen4ExpQAICDecodeRunner:
@@ -177,6 +188,73 @@ def is_retained_state(name: str) -> bool:
     return base.startswith(("gdn_", "ple_", "qsa_"))
 
 
+def run_opstats(
+    qpc_path: Path,
+    onnx_path: Path,
+    custom_io_path: Path,
+    work_dir: Path,
+    device_list: str,
+    iterations: int,
+    profile_start_iter: int,
+    profile_samples: int,
+) -> None:
+    """Run a profiling QPC and decode its raw device statistics."""
+    from qwen4_exp_dp16_decode_qpc_opstats import _write_batch
+
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    raw_stats = work_dir / "raw_device_stats"
+    opstats_dir = work_dir / "opstats"
+    qpc_binary_dir = qpc_path if (qpc_path / "programqpc.bin").is_file() else qpc_path / "qpc"
+    raw_stats.mkdir(parents=True)
+    opstats_dir.mkdir(parents=True)
+    batch_json = _write_batch(
+        onnx_path,
+        custom_io_path,
+        work_dir / "io",
+        BATCH_SIZE,
+        CONTEXT_LENGTH,
+        CONTEXT_LENGTH // 4,
+    )
+
+    runner_command = [
+        "/opt/qti-aic/exec/qaic-runner",
+        "-D",
+        device_list,
+        "-t",
+        str(qpc_binary_dir),
+        "-n",
+        str(iterations),
+        "--aic-profiling-type",
+        "raw_device_stats",
+        "--aic-profiling-start-iter",
+        str(profile_start_iter),
+        "--aic-profiling-num-samples",
+        str(profile_samples),
+        "--aic-profiling-out-dir",
+        str(raw_stats),
+        "--aic-batch-json-input",
+        str(batch_json),
+    ]
+    print("$", " ".join(runner_command), flush=True)
+    subprocess.run(runner_command, check=True)
+
+    opstats_command = [
+        "/opt/qti-aic/exec/qaic-opstats",
+        "--qpc",
+        str(qpc_binary_dir / "programqpc.bin"),
+        "--input-dir",
+        str(raw_stats),
+        "--output-dir",
+        str(opstats_dir),
+        "--summary",
+        "--trace",
+    ]
+    print("$", " ".join(opstats_command), flush=True)
+    subprocess.run(opstats_command, check=True)
+    print(f"opstats written to {opstats_dir}")
+
+
 def run_one_decode_step(qpc_path: Path) -> None:
     runner = Qwen4ExpQAICDecodeRunner(qpc_path)
     input_ids = np.zeros(runner.host_input_shapes["input_ids"], dtype=np.int64)
@@ -249,6 +327,7 @@ def run_decode_generation(
         raise ValueError("input_ids must contain at least one non-negative prompt token")
 
     generated_tokens = [np.argmax(last_logits, axis=-1).astype(np.int64)]
+    generation_start = time.perf_counter()
     for _ in range(1, generation_len):
         token_ids = generated_tokens[-1]
         ngram_embeddings = lookup.lookup(torch.from_numpy(token_ids), history)
@@ -256,11 +335,19 @@ def run_decode_generation(
         logits = qpc_runner.run_step(token_ids, ngram_embeddings, position_ids)
         generated_tokens.append(np.argmax(logits, axis=-1).astype(np.int64))
         position += 1
+    generation_seconds = time.perf_counter() - generation_start
 
     generated_ids = np.concatenate(generated_tokens, axis=1)
     generated_texts = tokenizer.batch_decode(generated_ids.tolist(), skip_special_tokens=True)
     print(f"prompt_decode_steps={prompt_steps}")
     print(f"generation_steps={generation_len}")
+    decode_steps = max(generation_len - 1, 0)
+    generated_steps_per_second = decode_steps / generation_seconds if decode_steps else 0.0
+    batch_tokens_per_second = generated_steps_per_second * generated_ids.shape[0]
+    print(f"generation_seconds={generation_seconds:.6f}")
+    print(f"measured_decode_steps={decode_steps}")
+    print(f"decode_tokens_per_second_per_sequence={generated_steps_per_second:.3f}")
+    print(f"decode_tokens_per_second_batch={batch_tokens_per_second:.3f}")
     print(f"generated_token_ids={generated_ids.tolist()}")
     for batch_index, generated_text in enumerate(generated_texts):
         print(f"generated_text[{batch_index}]={generated_text}")
@@ -286,6 +373,14 @@ def main() -> None:
         help="number of leading text layers to export; use 48 for the full model",
     )
     parser.add_argument("--num-devices", type=int, default=16, help="TS device count for DP and compilation")
+    parser.add_argument("--num-cores", type=int, default=NUM_CORES, help="cores per AI device")
+    parser.add_argument("--aic-hw-version", default="ai100", choices=("ai100", "ai200"))
+    parser.add_argument("--node-precision-info", type=Path, help="optional compiler NPI YAML")
+    parser.add_argument(
+        "--no-user-tiled",
+        action="store_true",
+        help="disable the default -user-tiled compiler option",
+    )
     parser.add_argument(
         "--compile-dir",
         type=Path,
@@ -293,6 +388,17 @@ def main() -> None:
         help="directory for exported ONNX and QPC artifacts",
     )
     parser.add_argument("--qpc", type=Path, help="reuse an existing QPC and skip model export/compile")
+    parser.add_argument(
+        "--opstats",
+        action="store_true",
+        help="compile a profiling QPC with .compile(), run qaic-runner, and decode QAIC opstats",
+    )
+    parser.add_argument("--device-list", default="0..15", help="QAIC device list for --opstats")
+    parser.add_argument("--opstats-work-dir", type=Path, help="output directory for --opstats artifacts")
+    parser.add_argument("--opstats-iterations", type=int, default=OPSTATS_ITERATIONS)
+    parser.add_argument("--opstats-profile-start-iter", type=int, default=OPSTATS_PROFILE_START_ITER)
+    parser.add_argument("--opstats-profile-samples", type=int, default=OPSTATS_PROFILE_SAMPLES)
+    parser.add_argument("--opstats-stats-level", type=int, default=OPSTATS_STATS_LEVEL)
     parser.add_argument("--prompt", help="optional prompt to run through the QEfficient generate API")
     parser.add_argument("--generation-len", type=int, default=8, help="maximum tokens for --prompt generation")
     args = parser.parse_args()
@@ -300,6 +406,10 @@ def main() -> None:
     if args.checkpoint is not None:
         args.checkpoint = args.checkpoint.resolve()
     args.compile_dir = args.compile_dir.resolve()
+    os.environ.setdefault("QAIC_COMPILER_OPTS_UNSUPPORTED", COMPILER_OPTS_UNSUPPORTED)
+    print(f"QAIC_COMPILER_OPTS_UNSUPPORTED={os.environ['QAIC_COMPILER_OPTS_UNSUPPORTED']}")
+    if args.opstats and args.qpc is not None:
+        parser.error("--opstats requires a fresh export/compile; omit --qpc")
 
     qeff_model = None
     if args.qpc is None:
@@ -308,6 +418,18 @@ def main() -> None:
             raise FileNotFoundError(f"Four-layer checkpoint directory not found: {args.checkpoint}")
         qeff_model = build_model(args.model_name_or_path, args.checkpoint, args.layers, args.num_devices)
         qeff_model.model.eval()
+        compiler_options = {} if args.no_user_tiled else {"user_tiled": True}
+        if args.node_precision_info is not None:
+            compiler_options["node_precision_info"] = str(args.node_precision_info)
+        if args.opstats:
+            compiler_options.update(
+                {
+                    "stats_level": args.opstats_stats_level,
+                    "ddr_stats": True,
+                    "aic_pmu_recipe": "KernelUtil",
+                    "aic_perf_metrics": True,
+                }
+            )
         qpc_path = Path(
             qeff_model.compile(
                 compile_dir=str(args.compile_dir),
@@ -315,18 +437,37 @@ def main() -> None:
                 ctx_len=CONTEXT_LENGTH,
                 prefill_seq_len=1,
                 num_devices=args.num_devices,
-                num_cores=NUM_CORES,
+                num_cores=args.num_cores,
                 mxfp6_matmul=False,
                 offload_pt_weights=False,
                 dynamo=True,
                 use_onnx_subfunctions=False,
-                aic_hw_version="ai200",
+                aic_hw_version=args.aic_hw_version,
                 mxint8_kv_cache=True,
                 allow_mxint8_mdp_io=True,
+                **compiler_options,
             )
         )
     else:
         qpc_path = args.qpc
+
+    if args.opstats:
+        onnx_path = Path(qeff_model.onnx_path).resolve()
+        custom_io_path = qpc_path.parent / "custom_io.yaml"
+        work_dir = (args.opstats_work_dir or args.compile_dir / "opstats_run").resolve()
+        if not custom_io_path.is_file():
+            raise FileNotFoundError(f"Custom IO file not found: {custom_io_path}")
+        run_opstats(
+            qpc_path=qpc_path,
+            onnx_path=onnx_path,
+            custom_io_path=custom_io_path,
+            work_dir=work_dir,
+            device_list=args.device_list,
+            iterations=args.opstats_iterations,
+            profile_start_iter=args.opstats_profile_start_iter,
+            profile_samples=args.opstats_profile_samples,
+        )
+        return
 
     if not (qpc_path / "programqpc.bin").is_file():
         raise FileNotFoundError(f"QPC binary not found: {qpc_path / 'programqpc.bin'}")
