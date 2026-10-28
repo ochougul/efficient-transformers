@@ -34,7 +34,6 @@ from transformers import AutoConfig, AutoTokenizer
 from QEfficient.transformers.models.qwen4_exp.host_ngram import HostNGramHistory, ShardedNGramLookup
 
 
-NUM_CORES = 4
 BATCH_SIZE = 16
 DEFAULT_LAYERS = 4
 CONTEXT_LENGTH = 65_536
@@ -48,7 +47,7 @@ COMPILER_OPTS_UNSUPPORTED = (
 )
 
 
-def _window_config_from_source(model_name_or_path: str | Path, layers: int):
+def _window_config_from_source(model_name_or_path: str | Path, layers: int, dtype: str):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from qwen4_exp_decode_parity import (
         _window_config,
@@ -56,11 +55,11 @@ def _window_config_from_source(model_name_or_path: str | Path, layers: int):
 
     model_path = Path(model_name_or_path)
     if model_path.is_dir():
-        return _window_config(model_path, layers, CONTEXT_LENGTH, dtype="bfloat16")
+        return _window_config(model_path, layers, CONTEXT_LENGTH, dtype=dtype)
 
     config = AutoConfig.from_pretrained(str(model_name_or_path))
     raw = config.text_config.to_dict()
-    raw["dtype"] = "bfloat16"
+    raw["dtype"] = dtype
     raw["num_hidden_layers"] = layers
     raw["layer_types"] = raw["layer_types"][:layers]
     raw["ple_layer_ids"] = [layer_id for layer_id in raw["ple_layer_ids"] if layer_id <= layers]
@@ -71,7 +70,14 @@ def _window_config_from_source(model_name_or_path: str | Path, layers: int):
     return Qwen4ExpTextConfig(**raw)
 
 
-def build_model(model_name_or_path: str | Path, checkpoint: Path | None, layers: int, num_devices: int):
+def build_model(
+    model_name_or_path: str | Path,
+    checkpoint: Path | None,
+    layers: int,
+    num_devices: int,
+    num_cores: int,
+    dtype: str,
+):
     qaic_config = {
         "indexer_dp": num_devices,
         "indexer_cp": 1,
@@ -87,7 +93,7 @@ def build_model(model_name_or_path: str | Path, checkpoint: Path | None, layers:
         "ffn_blocking_mode": "token",
         "ffn_token_block_size": 4,
     }
-    config = _window_config_from_source(model_name_or_path, layers)
+    config = _window_config_from_source(model_name_or_path, layers, dtype)
     from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM
 
     model_source = str(checkpoint) if checkpoint is not None else str(model_name_or_path)
@@ -96,17 +102,17 @@ def build_model(model_name_or_path: str | Path, checkpoint: Path | None, layers:
         config=config,
         qaic_config=qaic_config,
         weight_free=True,
-        torch_dtype=torch.float32,
+        torch_dtype=torch.bfloat16 if dtype == "bfloat16" else torch.float32,
     )
     model.model.eval()
     return model
 
 
-def _load_window_config(snapshot: Path, layers: int):
+def _load_window_config(snapshot: Path, layers: int, dtype: str):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from qwen4_exp_decode_parity import _window_config
 
-    return _window_config(snapshot, layers, CONTEXT_LENGTH, dtype="float32")
+    return _window_config(snapshot, layers, CONTEXT_LENGTH, dtype=dtype)
 
 
 class Qwen4ExpQAICDecodeRunner:
@@ -373,8 +379,19 @@ def main() -> None:
         help="number of leading text layers to export; use 48 for the full model",
     )
     parser.add_argument("--num-devices", type=int, default=16, help="TS device count for DP and compilation")
-    parser.add_argument("--num-cores", type=int, default=NUM_CORES, help="cores per AI device")
+    parser.add_argument(
+        "--num-cores",
+        type=int,
+        default=None,
+        help="cores per AI device; defaults to 16 for ai100 and 4 for ai200",
+    )
     parser.add_argument("--aic-hw-version", default="ai100", choices=("ai100", "ai200"))
+    parser.add_argument(
+        "--dtype",
+        choices=("bfloat16", "float32"),
+        default=None,
+        help="model/export precision; defaults to float32 for ai100 and bfloat16 for ai200",
+    )
     parser.add_argument("--node-precision-info", type=Path, help="optional compiler NPI YAML")
     parser.add_argument(
         "--no-user-tiled",
@@ -402,12 +419,17 @@ def main() -> None:
     parser.add_argument("--prompt", help="optional prompt to run through the QEfficient generate API")
     parser.add_argument("--generation-len", type=int, default=8, help="maximum tokens for --prompt generation")
     args = parser.parse_args()
+    if args.num_cores is None:
+        args.num_cores = 16 if args.aic_hw_version == "ai100" else 4
+    if args.dtype is None:
+        args.dtype = "float32" if args.aic_hw_version == "ai100" else "bfloat16"
     args.model_name_or_path = str(args.model_name_or_path)
     if args.checkpoint is not None:
         args.checkpoint = args.checkpoint.resolve()
     args.compile_dir = args.compile_dir.resolve()
     os.environ.setdefault("QAIC_COMPILER_OPTS_UNSUPPORTED", COMPILER_OPTS_UNSUPPORTED)
     print(f"QAIC_COMPILER_OPTS_UNSUPPORTED={os.environ['QAIC_COMPILER_OPTS_UNSUPPORTED']}")
+    print(f"aic_hw_version={args.aic_hw_version} num_cores={args.num_cores} dtype={args.dtype}")
     if args.opstats and args.qpc is not None:
         parser.error("--opstats requires a fresh export/compile; omit --qpc")
 
@@ -416,7 +438,14 @@ def main() -> None:
         os.environ.setdefault("QEFF_HOME", str(args.compile_dir))
         if args.checkpoint is not None and not args.checkpoint.is_dir():
             raise FileNotFoundError(f"Four-layer checkpoint directory not found: {args.checkpoint}")
-        qeff_model = build_model(args.model_name_or_path, args.checkpoint, args.layers, args.num_devices)
+        qeff_model = build_model(
+            args.model_name_or_path,
+            args.checkpoint,
+            args.layers,
+            args.num_devices,
+            args.num_cores,
+            args.dtype,
+        )
         qeff_model.model.eval()
         compiler_options = {} if args.no_user_tiled else {"user_tiled": True}
         if args.node_precision_info is not None:
@@ -489,7 +518,7 @@ def main() -> None:
             add_special_tokens=True,
         )["input_ids"]
         qpc_runner = Qwen4ExpQAICDecodeRunner(qpc_path)
-        config = _load_window_config(snapshot, args.layers)
+        config = _load_window_config(snapshot, args.layers, args.dtype)
         lookup = ShardedNGramLookup(config, snapshot)
         run_decode_generation(
             qpc_runner=qpc_runner,
