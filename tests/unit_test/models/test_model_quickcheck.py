@@ -75,7 +75,9 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
     Qwen3VLMoeVisionConfig,
 )
 
+from QEfficient.customop.ctx_scatter_gather import CompressedAttnFunc
 from QEfficient.transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+    DeepseekV4CompressorWeightAttributeTransform,
     QEffDeepseekV4Attention,
     QEffDeepseekV4Cache,
     QEffDeepseekV4UnweightedRMSNorm,
@@ -494,6 +496,52 @@ def test_deepseek_v4_csa_prefill_matches_token_decode():
     torch.testing.assert_close(prefill_output.logits, decode_output.logits, atol=2e-4, rtol=2e-4)
 
 
+def test_deepseek_v4_prefill_subfunction_outputs_match_decode_cache_names(tmp_path):
+    config = _tiny_deepseek_v4_config()
+    config.num_hidden_layers = 4
+    config.layer_types = [
+        "sliding_attention",
+        "sliding_attention",
+        "compressed_sparse_attention",
+        "heavily_compressed_attention",
+    ]
+    config.mlp_layer_types = ["hash_moe"] * config.num_hidden_layers
+    config.sliding_window = 8
+    decode_model = QEFFAutoModelForCausalLM(DeepseekV4ForCausalLM(deepcopy(config)).eval())
+    decode_onnx_path = decode_model.export(
+        export_dir=str(tmp_path / "decode"),
+        use_onnx_subfunctions=True,
+        dynamo=True,
+        export_batch_size=1,
+        cache_ctx_len=32,
+        offload_pt_weights=False,
+    )
+    prefill_config = deepcopy(config)
+    prefill_config.qeff_csa_prefill_q_block_size = 8
+    prefill_config.qeff_csa_prefill_attn_gather_sub_qc = 4
+    prefill_config.qeff_csa_prefill_indexer_kv_block_size = 2
+    prefill_config.qeff_csa_prefill_indexer_topk_per_block = 1
+    prefill_config.qeff_csa_prefill_indexer_mode = "global"
+    prefill_config.qeff_hca_prefill_q_block_size = 8
+    prefill_config.qeff_hca_prefill_comp_kv_block_size = 2
+    prefill_model = QEFFAutoModelForCausalLM(DeepseekV4ForCausalLM(prefill_config).eval())
+    prefill_onnx_path = prefill_model.export(
+        export_dir=str(tmp_path / "prefill"),
+        prefill_only=True,
+        prefill_seq_len=8,
+        use_onnx_subfunctions=True,
+        dynamo=True,
+        export_batch_size=1,
+        cache_ctx_len=32,
+        offload_pt_weights=False,
+    )
+
+    decode_outputs = {output.name for output in onnx.load(decode_onnx_path, load_external_data=False).graph.output}
+    prefill_outputs = {output.name for output in onnx.load(prefill_onnx_path, load_external_data=False).graph.output}
+
+    assert prefill_outputs == decode_outputs
+
+
 def test_deepseek_v4_csa_prefill_indexer_global_selection_is_exact():
     config = _tiny_deepseek_v4_config()
     config.qeff_csa_prefill_indexer_kv_block_size = 2
@@ -530,6 +578,139 @@ def test_deepseek_v4_csa_prefill_indexer_global_selection_is_exact():
 
     torch.testing.assert_close(selected, torch.tensor([[[3, 1], [3, 1]]]))
     assert valid.all()
+
+
+def test_deepseek_v4_csa_prefill_indexer_admits_completed_entry_at_boundary():
+    config = _tiny_deepseek_v4_config()
+    attention = QEFFAutoModelForCausalLM(DeepseekV4ForCausalLM(config).eval()).model.layers[0].self_attn
+    q_index = torch.ones((1, 1, 1, 1))
+    index_weights = torch.ones((1, 1, 1))
+    position_ids = torch.tensor([[3]])
+    indexer_kv_cache = torch.tensor([[[1.0], [2.0], [3.0], [4.0]]])
+
+    selected, valid = attention._csa_prefill_select_indexer_slots(
+        q_index,
+        index_weights,
+        position_ids,
+        indexer_kv_cache,
+        index_topk=2,
+        compression_rate=2,
+    )
+
+    torch.testing.assert_close(selected, torch.tensor([[[1, 0]]]))
+    assert valid.all()
+
+
+def test_deepseek_v4_weight_free_subfunction_binds_compressor_weights_as_attributes(tmp_path):
+    from onnx import TensorProto, helper
+    from safetensors.torch import save_file
+
+    checkpoint_dir = tmp_path / "prepared-checkpoint"
+    checkpoint_dir.mkdir()
+    weight_names = [f"model.layers.{layer}.self_attn.compressor.kv_proj.weight" for layer in (4, 6)]
+    gate_weight_names = [f"model.layers.{layer}.self_attn.compressor.gate_proj.weight" for layer in (4, 6)]
+    output_weight_names = [f"model.layers.{layer}.self_attn.o_b_proj.weight" for layer in (4, 6)]
+    all_weight_names = weight_names + gate_weight_names + output_weight_names
+    save_file(
+        {name: torch.ones((4, 4), dtype=torch.float16) for name in all_weight_names},
+        str(checkpoint_dir / "weights.safetensors"),
+    )
+    weight_spec_path = tmp_path / "weight_spec.json"
+    weight_spec_path.write_text(
+        json.dumps(
+            {
+                "model_id": str(checkpoint_dir),
+                "external_data_root": str(tmp_path),
+                "files": [{"format": "safetensors", "path": "prepared-checkpoint/weights.safetensors"}],
+                "inputs": [{"name": name, "location": {"file": 0, "key": name}} for name in all_weight_names],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    function_nodes = [
+        helper.make_node("Transpose", ["kv_weight"], ["kv_weight_t"]),
+        helper.make_node("Transpose", ["gate_weight"], ["gate_weight_t"]),
+        helper.make_node("Transpose", ["output_weight"], ["output_weight_t"]),
+        helper.make_node("MatMul", ["hidden", "kv_weight_t"], ["kv_output"], name="node_linear_4"),
+        helper.make_node("MatMul", ["hidden", "gate_weight_t"], ["gate_output"], name="node_linear_5"),
+        helper.make_node("MatMul", ["hidden", "output_weight_t"], ["output_output"], name="node_linear_6"),
+        helper.make_node("Add", ["kv_output", "gate_output"], ["compressor_output"]),
+        helper.make_node("Add", ["compressor_output", "output_output"], ["layer_output"]),
+    ]
+    function = helper.make_function(
+        "pkg.torch.__subgraph__",
+        "QEffDeepseekV4DecoderLayer_3",
+        ["hidden", "kv_weight", "gate_weight", "output_weight"],
+        ["layer_output"],
+        function_nodes,
+        [helper.make_opsetid("", 17)],
+    )
+    call_nodes = []
+    graph_inputs = []
+    graph_outputs = []
+    for layer in (4, 6):
+        call_inputs = [f"hidden_{layer}"]
+        graph_inputs.append(helper.make_tensor_value_info(call_inputs[0], TensorProto.FLOAT16, [1, 4]))
+        layer_weights = [
+            f"model.layers.{layer}.self_attn.compressor.kv_proj.weight",
+            f"model.layers.{layer}.self_attn.compressor.gate_proj.weight",
+            f"model.layers.{layer}.self_attn.o_b_proj.weight",
+        ]
+        for name in layer_weights:
+            call_inputs.append(name)
+            graph_inputs.append(helper.make_tensor_value_info(name, TensorProto.FLOAT16, [4, 4]))
+        output_name = f"layer_output_{layer}"
+        call_nodes.append(
+            helper.make_node(
+                function.name,
+                call_inputs,
+                [output_name],
+                name=f"node_invoke_subgraph_{layer}__0",
+                domain=function.domain,
+            )
+        )
+        graph_outputs.append(helper.make_tensor_value_info(output_name, TensorProto.FLOAT16, [1, 4]))
+
+    model = helper.make_model(
+        helper.make_graph(call_nodes, "deepseek_v4", graph_inputs, graph_outputs),
+        functions=[function],
+        opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid(function.domain, 1)],
+    )
+    model.ir_version = 10
+    model_path = tmp_path / "deepseek_v4.onnx"
+    onnx.save_model(model, model_path)
+
+    assert DeepseekV4CompressorWeightAttributeTransform.apply(model, weight_spec_path=weight_spec_path)
+
+    transformed_function = model.functions[0]
+    assert len(transformed_function.input) == 3
+    assert len(transformed_function.attribute) == 1
+    assert [len(node.input) for node in model.graph.node] == [3, 3]
+    assert all(len(node.attribute) == 1 for node in model.graph.node)
+    assert {value.name for value in model.graph.input} == {
+        "hidden_4",
+        "hidden_6",
+        *gate_weight_names,
+        *output_weight_names,
+    }
+    assert [entry["name"] for entry in json.loads(weight_spec_path.read_text())["inputs"]] == [
+        *gate_weight_names,
+        *output_weight_names,
+    ]
+
+    onnx.save_model(model, model_path)
+    onnx.checker.check_model(str(model_path), full_check=False)
+
+
+def test_compressed_attn_all_invalid_row_returns_zero():
+    kv_cache = torch.tensor([[[1.0], [2.0]]])
+    topk_indices = torch.tensor([[[0, 1]]], dtype=torch.int32)
+    valid = torch.zeros((1, 1, 2), dtype=torch.bool)
+    query = torch.ones((1, 1, 1, 1))
+    output = CompressedAttnFunc.apply(kv_cache, topk_indices, valid, query, torch.tensor(1.0), torch.tensor(-3.0e4))
+
+    torch.testing.assert_close(output, torch.zeros_like(output))
 
 
 def test_deepseek_v4_hca_prefill_preserves_rank_four_compressed_cache():

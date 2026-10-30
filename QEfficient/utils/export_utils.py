@@ -46,6 +46,17 @@ from QEfficient.utils.torch_patches import (
 )
 
 logger = QEFFLogger.get_logger("INFRA")
+ONNX_SUBFUNCTION_VERSION = 4
+DEEPSEEK_WEIGHT_FREE_SUBFUNCTION_VERSION = 5
+
+
+def _onnx_subfunction_version(qeff_model) -> int:
+    has_export_transform = callable(getattr(qeff_model.model, "get_onnx_transforms_for_export", None))
+    if getattr(qeff_model, "_weight_free", False) and has_export_transform:
+        return DEEPSEEK_WEIGHT_FREE_SUBFUNCTION_VERSION
+    return ONNX_SUBFUNCTION_VERSION
+
+
 _EXPORT_FROM_COMPILE = ContextVar("export_from_compile", default=False)
 
 
@@ -554,7 +565,7 @@ def _generate_export_hash(qeff_model, args, kwargs, func):
     if getattr(qeff_model, "_weight_free", False):
         copy_of_hash_params["weight_free"] = True
     if getattr(qeff_model, "_use_onnx_subfunctions", False):
-        copy_of_hash_params["onnx_subfunction_version"] = 4
+        copy_of_hash_params["onnx_subfunction_version"] = _onnx_subfunction_version(qeff_model)
     # Generate hash from relevant parameters
     export_hash, filtered_hash_params = create_export_hash(
         model_params=copy_of_hash_params,
@@ -600,7 +611,7 @@ def _setup_onnx_subfunctions(qeff_model, args, kwargs, dynamo=False):
     orig_hash_subfunction_version = qeff_model.hash_params.get("onnx_subfunction_version")
     qeff_model._use_onnx_subfunctions = True
     qeff_model.hash_params["use_onnx_subfunctions"] = True
-    qeff_model.hash_params["onnx_subfunction_version"] = 4
+    qeff_model.hash_params["onnx_subfunction_version"] = _onnx_subfunction_version(qeff_model)
     # TorchScript patches are irrelevant on the dynamo path.
     if not dynamo:
         apply_torch_patches()

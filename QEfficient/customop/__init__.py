@@ -6,6 +6,7 @@
 # -----------------------------------------------------------------------------
 
 from QEfficient.customop.ctx_scatter_gather import (
+    CSAJointAttentionFunc,
     CompressedAttnFunc,
     CtxChunkScatterBatchFunc,
     CtxGather1DFunc,
@@ -78,6 +79,7 @@ __all__ = [
     "CtxGatherFunc",
     "CtxGather1DFunc",
     "CompressedAttnFunc",
+    "CSAJointAttentionFunc",
     "CtxGatherFunc3D",
     "CtxGatherFunc3DGeneralized",
     "CtxGatherFuncBlockedKV",

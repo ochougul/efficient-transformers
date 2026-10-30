@@ -830,9 +830,11 @@ def CompressedAttn(
         batch_dims=1,
     )
     gathered = ops.Reshape(gathered, ops.Concat(batch_size, sequence_length, top_k, head_dim, axis=0))
+    gathered = ops.Where(ops.Unsqueeze(valid, [-1]), gathered, ops.Constant(value_float=0.0))
     scores = ops.Mul(ops.Einsum(query, gathered, equation="bshd,bskd->bshk"), scale)
     scores = ops.Where(ops.Unsqueeze(valid, [2]), scores, masked_logit)
     probabilities = ops.Softmax(scores, axis=-1)
+    probabilities = ops.Where(ops.Unsqueeze(valid, [2]), probabilities, ops.Constant(value_float=0.0))
     return ops.Einsum(probabilities, gathered, equation="bshk,bskd->bshd")
 
 
@@ -854,9 +856,11 @@ class CompressedAttnFunc(torch.autograd.Function):
         gathered = kv_cache[batch_idx, topk_indices.reshape(batch_size, -1).to(torch.long)].reshape(
             batch_size, sequence_length, top_k, kv_cache.shape[-1]
         )
+        gathered = torch.where(valid.unsqueeze(-1), gathered, torch.zeros_like(gathered))
         scores = torch.matmul(query.float(), gathered.transpose(-1, -2).float()) * scale
         scores = torch.where(valid.unsqueeze(2), scores, masked_logit)
-        return torch.matmul(torch.softmax(scores, dim=-1).to(gathered.dtype), gathered)
+        probabilities = torch.where(valid.unsqueeze(2), torch.softmax(scores, dim=-1), torch.zeros_like(scores))
+        return torch.matmul(probabilities.to(gathered.dtype), gathered)
 
     @staticmethod
     def setup_context(ctx, inputs, outputs):
@@ -875,3 +879,100 @@ class CompressedAttnFunc(torch.autograd.Function):
         return g.onnxscript_op(CompressedAttn, kv_cache, topk_indices, valid, query, scale, masked_logit).setTypeAs(
             query
         )
+
+
+@qeff_custom_op("com.qualcomm.cloud", 1)
+def CSAJointAttention(
+    local_kv: onnxscript.FLOAT,
+    local_valid: onnxscript.BOOL,
+    compressed_kv: onnxscript.FLOAT,
+    compressed_indices: onnxscript.INT32,
+    compressed_valid: onnxscript.BOOL,
+    query: onnxscript.FLOAT,
+    sinks: onnxscript.FLOAT,
+    scale: onnxscript.FLOAT,
+    masked_logit: onnxscript.FLOAT,
+) -> onnxscript.FLOAT:
+    """Sequence-major fused cache gather and joint local/sink/compressed attention."""
+    batch_size = ops.Gather(ops.Shape(compressed_kv), [0])
+    query_length = ops.Gather(ops.Shape(compressed_indices), [1])
+    top_k = ops.Gather(ops.Shape(compressed_indices), [2])
+    head_dim = ops.Gather(ops.Shape(compressed_kv), [2])
+    flat_indices = ops.Reshape(compressed_indices, ops.Concat(batch_size, ops.Mul(query_length, top_k), axis=0))
+    gathered_flat = ops.GatherND(compressed_kv, ops.Unsqueeze(flat_indices, [-1]), batch_dims=1)
+    compressed_kv = ops.Reshape(
+        gathered_flat, ops.Concat(batch_size, query_length, top_k, head_dim, axis=0)
+    )
+    num_heads = ops.Gather(ops.Shape(query), [2])
+    sink_shape = ops.Concat(batch_size, query_length, num_heads, ops.Constant(value_ints=[1]), axis=0)
+    sink_logits = ops.Expand(ops.Unsqueeze(sinks, [0, 1, 3]), sink_shape)
+
+    local_scores = ops.Mul(ops.Einsum(query, local_kv, equation="bshd,btd->bsht"), scale)
+    local_scores = ops.Where(ops.Unsqueeze(local_valid, [2]), local_scores, masked_logit)
+    compressed_scores = ops.Mul(ops.Einsum(query, compressed_kv, equation="bshd,bskd->bshk"), scale)
+    compressed_valid_heads = ops.Unsqueeze(compressed_valid, [2])
+    compressed_scores = ops.Where(compressed_valid_heads, compressed_scores, masked_logit)
+    local_length = ops.Gather(ops.Shape(local_kv), [1])
+    local_value_shape = ops.Concat(batch_size, query_length, local_length, head_dim, axis=0)
+    local_values = ops.Expand(ops.Unsqueeze(local_kv, [1]), local_value_shape)
+    sink_value_shape = ops.Concat(batch_size, query_length, ops.Constant(value_ints=[1]), head_dim, axis=0)
+    sink_values = ops.Expand(ops.Constant(value_float=0.0), sink_value_shape)
+    all_scores = ops.Concat(local_scores, sink_logits, compressed_scores, axis=3)
+    all_values = ops.Concat(local_values, sink_values, compressed_kv, axis=2)
+    return ops.Einsum(ops.Softmax(all_scores, axis=3), all_values, equation="bsht,bstd->bshd")
+
+
+class CSAJointAttentionFunc(torch.autograd.Function):
+    """CSA joint attention with a compiler-stable ONNX custom-op boundary."""
+
+    @staticmethod
+    def forward(
+        local_kv, local_valid, compressed_cache, compressed_indices, compressed_valid, query, sinks, scale, masked_logit
+    ):
+        batch_size, query_length, top_k = compressed_indices.shape
+        batch_indices = torch.arange(batch_size, device=compressed_cache.device).view(-1, 1, 1)
+        compressed_kv = compressed_cache[
+            batch_indices, compressed_indices.to(torch.long)
+        ].reshape(batch_size, query_length, top_k, compressed_cache.shape[-1])
+        local_scores = torch.einsum("bshd,btd->bsht", query.float(), local_kv.float()) * scale
+        local_scores = torch.where(local_valid.unsqueeze(2), local_scores, masked_logit)
+        sink_logits = sinks.float().view(1, 1, -1, 1).expand(query.shape[0], query.shape[1], -1, -1)
+        compressed_scores = torch.einsum("bshd,bskd->bshk", query.float(), compressed_kv.float()) * scale
+        compressed_scores = torch.where(compressed_valid.unsqueeze(2), compressed_scores, masked_logit)
+        all_scores = torch.cat((local_scores, sink_logits, compressed_scores), dim=3)
+        local_values = local_kv.float().unsqueeze(1).expand(-1, query.shape[1], -1, -1)
+        sink_values = torch.zeros(
+            query.shape[0], query.shape[1], 1, local_kv.shape[-1], dtype=torch.float32, device=query.device
+        )
+        all_values = torch.cat((local_values, sink_values, compressed_kv.float()), dim=2)
+        return torch.einsum("bsht,bstd->bshd", torch.softmax(all_scores, dim=3), all_values)
+
+    @staticmethod
+    def setup_context(ctx, inputs, outputs):
+        pass
+
+    @staticmethod
+    def symbolic(
+        g,
+        local_kv,
+        local_valid,
+        compressed_kv,
+        compressed_indices,
+        compressed_valid,
+        query,
+        sinks,
+        scale,
+        masked_logit,
+    ):
+        return g.onnxscript_op(
+            CSAJointAttention,
+            local_kv,
+            local_valid,
+            compressed_kv,
+            compressed_indices,
+            compressed_valid,
+            query,
+            sinks,
+            scale,
+            masked_logit,
+        ).setTypeAs(query)

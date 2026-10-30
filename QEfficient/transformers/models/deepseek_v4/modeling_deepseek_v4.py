@@ -5,8 +5,13 @@
 #
 # -----------------------------------------------------------------------------
 
+import json
+import re
+import struct
+from pathlib import Path
 from typing import Any
 
+import onnx
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -1224,7 +1229,7 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
         if indexer_mode == "blockwise" and topk_per_tile < 1:
             raise ValueError("CSA prefill indexer top-k per tile must be positive.")
 
-        causal_threshold = torch.floor(position_ids.float() * (1.0 / compression_rate)).to(position_ids.dtype)
+        causal_threshold = torch.div(position_ids + 1, compression_rate, rounding_mode="floor")
         causal_threshold = causal_threshold.unsqueeze(-1)
         if indexer_mode == "blockwise":
             num_tiles = (capacity + tile_size - 1) // tile_size
@@ -1240,7 +1245,7 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
             tile_scores = torch.einsum("bshd,btd->bsht", q_index.float(), tile_cache.float()).relu()
             tile_scores = (tile_scores * index_weights.unsqueeze(-1)).sum(dim=2)
             tile_indices = torch.arange(tile_start, tile_end, device=indexer_kv_cache.device).view(1, 1, -1)
-            tile_scores = tile_scores.masked_fill(tile_indices >= causal_threshold, -3.0e4)
+            tile_scores = tile_scores.masked_fill(tile_indices >= causal_threshold, float("-inf"))
 
             if indexer_mode == "global":
                 score_parts.append(tile_scores)
@@ -1365,7 +1370,7 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
         position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
         position_ids: torch.Tensor,
         cache_layer: QEffSlidingCacheLayer,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         if not cache_layer._folded_row_cache:
             raise ValueError("SWA prefill requires the folded sliding-window cache layout.")
 
@@ -1398,15 +1403,18 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
         key_states = torch.cat((carry_kv, kv), dim=2)
         attention_output, _ = self._attention_forward(query, key_states, ~local_valid.unsqueeze(1))
         attention_output = qeff_apply_rotary_pos_emb(attention_output.transpose(1, 2), cos, -sin).transpose(1, 2)
-        
-        cache_layer.sliding_window_kv = ctx_scatter_folded_rows(
+
+        sliding_window_kv = ctx_scatter_folded_rows(
             cache_layer.sliding_window_kv,
             torch.remainder(position_ids, self.sliding_window).to(torch.int32),
             kv,
         )
-        cache_layer.cumulative_length += sequence_length
+        if not _is_export_capture():
+            cache_layer.sliding_window_kv = sliding_window_kv
+            cache_layer.cumulative_length += sequence_length
         grouped = attention_output.reshape(batch_size, sequence_length, self.config.o_groups, -1)
-        return self.o_b_proj(self.o_a_proj(grouped).flatten(2))
+        attention_output = self.o_b_proj(self.o_a_proj(grouped).flatten(2))
+        return attention_output, (sliding_window_kv.clone(),)
 
     def _csa_prefill_forward(
         self,
@@ -1414,7 +1422,7 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
         position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
         position_ids: torch.Tensor,
         cache_layer: QEffCSACacheLayer,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         if self.compressor is None or not cache_layer.prefill_only:
             raise ValueError("CSA prefill requires the benchmark CSA retained-state layout.")
         batch_size, sequence_length, _ = hidden_states.shape
@@ -1527,38 +1535,38 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
             local_masked_logit = local_scores[:, :, :1, :1].sum() * 0.0 - 3.0e4
             local_scores = torch.where(local_valid.unsqueeze(1), local_scores, local_masked_logit)
 
-            safe_selected = torch.where(selected_valid, selected, torch.zeros_like(selected)).to(torch.long)
-            selected_kv = torch.gather(
-                compressed_kv_cache.unsqueeze(1).expand(-1, chunk_length, -1, -1),
-                2,
-                safe_selected.unsqueeze(-1).expand(-1, -1, -1, compressed_kv_cache.shape[-1]),
+            attention_output = torch.ops.qefficient.csa_joint_attention(
+                local_states.float(),
+                local_valid,
+                compressed_kv_cache.float(),
+                selected.to(torch.int32),
+                selected_valid,
+                query_chunk.transpose(1, 2).float(),
+                self.sinks.float(),
+                (query_chunk[:, :1, :1, :1].sum() * 0.0 + self.scaling).float(),
+                local_masked_logit,
             )
-            compressed_scores = torch.einsum("bhsd,bskd->bhsk", query_chunk.float(), selected_kv.float()) * self.scaling
-            compressed_scores = torch.where(selected_valid.unsqueeze(1), compressed_scores, local_masked_logit)
-
-            sinks = self.sinks.view(1, self.num_heads, 1, 1).expand(batch_size, -1, chunk_length, -1).float()
-            combined_scores = torch.cat((local_scores, sinks, compressed_scores), dim=-1)
-            combined_probs = F.softmax(combined_scores, dim=-1, dtype=torch.float32)
-            local_probs, _, compressed_probs = combined_probs.split(
-                (local_scores.shape[-1], 1, compressed_scores.shape[-1]), dim=-1
-            )
-            attention_output = torch.einsum("bhst,btd->bhsd", local_probs, local_states.float())
-            attention_output = attention_output + torch.einsum("bhsk,bskd->bhsd", compressed_probs, selected_kv.float())
             attention_output = self._csa_prefill_rotate(
-                attention_output.transpose(1, 2), cos[:, start:end], sin[:, start:end], inverse=True, sequence_major=True
-            ).transpose(1, 2)
-            chunk_outputs.append(attention_output.to(hidden_states.dtype))
+                attention_output, cos[:, start:end], sin[:, start:end], inverse=True, sequence_major=True
+            )
+            chunk_outputs.append(attention_output.transpose(1, 2).to(hidden_states.dtype))
 
-        cache_layer.local_kv_cache = local_kv_cache
-        cache_layer.compressed_kv_cache = compressed_kv_cache
-        cache_layer.compressor_kv_state = compressor_kv_state
-        cache_layer.compressor_score_state = compressor_score_state
-        cache_layer.indexer_kv_cache = indexer_kv_cache
-        cache_layer.indexer_kv_state = indexer_kv_state
-        cache_layer.indexer_score_state = indexer_score_state
+        cache_states = (
+            local_kv_cache,
+            compressed_kv_cache,
+            compressor_kv_state,
+            compressor_score_state,
+            indexer_kv_cache,
+            indexer_kv_state,
+            indexer_score_state,
+        )
+        if not _is_export_capture():
+            for name, state in zip(QEffDeepseekV4Cache._CSA_STATE_NAMES, cache_states):
+                setattr(cache_layer, name, state)
         attention_output = torch.cat(chunk_outputs, dim=2).transpose(1, 2)
         grouped = attention_output.reshape(batch_size, sequence_length, self.config.o_groups, -1)
-        return self.o_b_proj(self.o_a_proj(grouped).flatten(2))
+        attention_output = self.o_b_proj(self.o_a_proj(grouped).flatten(2))
+        return attention_output, tuple(state.clone() for state in cache_states)
 
     def _hca_prefill_forward(
         self,
@@ -1566,7 +1574,7 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
         position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]],
         position_ids: torch.Tensor,
         cache_layer: QEffHCACacheLayer,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         if self.compressor is None or not cache_layer.prefill_only:
             raise ValueError("HCA prefill requires the benchmark HCA retained-state layout.")
         if cache_layer.uses_dp_layout or cache_layer.compressed_kv_cp != 1:
@@ -1587,6 +1595,8 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
 
         local_kv_cache = cache_layer.sliding_window_kv
         compressed_kv_cache = cache_layer.actual_compressed_kv
+        compressor_kv_buffer = cache_layer.compressor_kv_buffer
+        compressor_gate_buffer = cache_layer.compressor_gate_buffer
         compressor_state = torch.zeros(
             batch_size,
             ratio,
@@ -1627,8 +1637,18 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
 
             kv_all = self.compressor.kv_proj(hidden_chunk).float()
             slots = torch.remainder(position_chunk, ratio).to(torch.long)
-            score_all = self.compressor.gate_proj(hidden_chunk).float() + F.embedding(
-                slots, self.compressor.position_bias
+            gate_all = self.compressor.gate_proj(hidden_chunk)
+            score_all = gate_all.float() + F.embedding(slots, self.compressor.position_bias)
+            buffer_positions = torch.remainder(position_chunk, ratio)
+            compressor_kv_buffer = ctx_scatter(
+                compressor_kv_buffer,
+                buffer_positions,
+                kv_all.to(hidden_states.dtype).unsqueeze(1),
+            )
+            compressor_gate_buffer = ctx_scatter(
+                compressor_gate_buffer,
+                buffer_positions,
+                gate_all.to(hidden_states.dtype).unsqueeze(1),
             )
             lead_full = (ratio - start % ratio) % ratio
             lead = lead_full if 0 < lead_full <= chunk_length else 0
@@ -1751,13 +1771,19 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
             )
             chunk_outputs.append(local_output + compressed_output)
 
-        cache_layer.sliding_window_kv = local_kv_cache
-        cache_layer.actual_compressed_kv = compressed_kv_cache
-        cache_layer.compressor_kv_buffer = cache_layer.compressor_kv_buffer.clone()
-        cache_layer.compressor_gate_buffer = cache_layer.compressor_gate_buffer.clone()
+        cache_states = (
+            local_kv_cache,
+            compressor_kv_buffer,
+            compressor_gate_buffer,
+            compressed_kv_cache,
+        )
+        if not _is_export_capture():
+            for name, state in zip(QEffDeepseekV4Cache._HCA_STATE_NAMES, cache_states):
+                setattr(cache_layer, name, state)
         attention_output = torch.cat(chunk_outputs, dim=1)
         grouped = attention_output.reshape(batch_size, sequence_length, self.config.o_groups, -1)
-        return self.o_b_proj(self.o_a_proj(grouped).flatten(2))
+        attention_output = self.o_b_proj(self.o_a_proj(grouped).flatten(2))
+        return attention_output, tuple(state.clone() for state in cache_states)
 
     def _attention_forward(
         self,
@@ -2107,7 +2133,7 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, ...]]:
         if past_key_values is not None and not isinstance(past_key_values, QEffDeepseekV4Cache):
             raise TypeError("QEffDeepseekV4Attention requires QEffDeepseekV4Cache.")
         if self.layer_type == "sliding_attention" and bool(getattr(self.config, "qeff_swa_prefill_only", False)):
@@ -2116,7 +2142,10 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
             layer = past_key_values.layers[self.layer_idx]
             if not isinstance(layer, QEffSlidingCacheLayer):
                 raise TypeError("SWA prefill requires a QEffSlidingCacheLayer.")
-            return self._swa_prefill_forward(hidden_states, position_embeddings, position_ids, layer), None
+            attention_output, cache_states = self._swa_prefill_forward(
+                hidden_states, position_embeddings, position_ids, layer
+            )
+            return attention_output, None, cache_states
         if self.layer_type == "compressed_sparse_attention" and bool(
             getattr(self.config, "qeff_csa_prefill_only", False)
         ):
@@ -2125,7 +2154,10 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
             layer = past_key_values.layers[self.layer_idx]
             if not isinstance(layer, QEffCSACacheLayer):
                 raise TypeError("CSA prefill requires a QEffCSACacheLayer.")
-            return self._csa_prefill_forward(hidden_states, position_embeddings, position_ids, layer), None
+            attention_output, cache_states = self._csa_prefill_forward(
+                hidden_states, position_embeddings, position_ids, layer
+            )
+            return attention_output, None, cache_states
         if self.layer_type == "heavily_compressed_attention" and bool(
             getattr(self.config, "qeff_hca_prefill_only", False)
         ):
@@ -2134,7 +2166,10 @@ class QEffDeepseekV4Attention(DeepseekV4Attention):
             layer = past_key_values.layers[self.layer_idx]
             if not isinstance(layer, QEffHCACacheLayer):
                 raise TypeError("HCA prefill requires a QEffHCACacheLayer.")
-            return self._hca_prefill_forward(hidden_states, position_embeddings, position_ids, layer), None
+            attention_output, cache_states = self._hca_prefill_forward(
+                hidden_states, position_embeddings, position_ids, layer
+            )
+            return attention_output, None, cache_states
         if hidden_states.shape[1] != 1:
             raise ValueError("QEff attention is decode-only and requires query length 1.")
 
@@ -2449,6 +2484,16 @@ class QEffDeepseekV4Cache(Cache):
         "indexer_kv_state",
         "indexer_score_state",
     )
+
+    @classmethod
+    def state_names_for_layer_type(cls, layer_type: str) -> tuple[str, ...]:
+        if layer_type == "sliding_attention":
+            return ("sliding_window_kv",)
+        if layer_type == "heavily_compressed_attention":
+            return cls._HCA_STATE_NAMES
+        if layer_type == "compressed_sparse_attention":
+            return cls._CSA_STATE_NAMES
+        raise ValueError(f"Unsupported DeepSeek V4 attention layer type: {layer_type}")
 
     def __init__(self, layers: list[CacheLayerMixin]) -> None:
         super().__init__(layers=layers)
@@ -2943,11 +2988,16 @@ class QEffDeepseekV4DecoderLayer(DeepseekV4DecoderLayer):
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         dtype = hidden_states.dtype
         post, comb, collapsed = self.attn_hc(hidden_states)
         normalized = self.input_layernorm(collapsed.to(dtype)).to(dtype)
-        attn_output, _ = self.self_attn(normalized, **kwargs)
+        attention_result = self.self_attn(normalized, **kwargs)
+        if len(attention_result) == 3:
+            attn_output, _, cache_states = attention_result
+        else:
+            attn_output, _ = attention_result
+            cache_states = None
         hidden_states = post.to(dtype).unsqueeze(-1) * attn_output.unsqueeze(-2) + torch.matmul(
             comb.to(dtype).transpose(-1, -2), hidden_states
         )
@@ -2955,9 +3005,174 @@ class QEffDeepseekV4DecoderLayer(DeepseekV4DecoderLayer):
         post, comb, collapsed = self.ffn_hc(hidden_states)
         normalized = self.post_attention_layernorm(collapsed.to(dtype)).to(dtype)
         mlp_output = self.mlp(normalized, input_ids=input_ids)
-        return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
+        hidden_states = post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
             comb.to(dtype).transpose(-1, -2), hidden_states
         )
+        return hidden_states if cache_states is None else (hidden_states, *cache_states)
+
+
+class DeepseekV4CompressorWeightAttributeTransform:
+    @classmethod
+    def apply(cls, model: onnx.ModelProto, *, weight_spec_path: str | Path) -> bool:
+        weight_spec_path = Path(weight_spec_path)
+        weight_spec = json.loads(weight_spec_path.read_text(encoding="utf-8"))
+        weight_inputs = {entry["name"]: entry for entry in weight_spec["inputs"]}
+        checkpoint_root = Path(weight_spec.get("external_data_root", weight_spec_path.parent))
+        prepared_checkpoint = Path(weight_spec["model_id"])
+        prepared_checkpoint_name = prepared_checkpoint.name
+        graph_inputs = {value.name: value for value in model.graph.input}
+        functions = {(function.domain, function.name): function for function in model.functions}
+        calls_by_function = {}
+        for node in model.graph.node:
+            key = (node.domain, node.op_type)
+            if key in functions:
+                calls_by_function.setdefault(key, []).append(node)
+
+        bindings = []
+        for key, calls in calls_by_function.items():
+            if len(calls) < 2:
+                continue
+            function = functions[key]
+            formal_inputs = list(function.input)
+            producer_by_output = {output: node for node in function.node for output in node.output}
+            matmul_weight_slots = set()
+            for node in function.node:
+                if node.op_type != "MatMul" or len(node.input) < 2:
+                    continue
+                weight_name = node.input[1]
+                while weight_name in producer_by_output and producer_by_output[weight_name].op_type in {
+                    "Transpose",
+                    "Cast",
+                    "Identity",
+                    "Reshape",
+                    "Squeeze",
+                    "Unsqueeze",
+                }:
+                    weight_name = producer_by_output[weight_name].input[0]
+                if weight_name in formal_inputs:
+                    matmul_weight_slots.add(formal_inputs.index(weight_name))
+
+            for slot in matmul_weight_slots:
+                call_weights = [call.input[slot] for call in calls]
+                compressor_weights = [
+                    name
+                    for name in call_weights
+                    if re.fullmatch(r"model\.layers\.\d+\.self_attn\.compressor\.kv_proj\.weight", name)
+                ]
+                if not compressor_weights:
+                    continue
+                if len(compressor_weights) != len(calls):
+                    raise ValueError(
+                        f"Repeated DeepSeek V4 function {function.name} mixes compressor MatMul weights with "
+                        "other inputs; cannot safely bind the weight as a function attribute."
+                    )
+                if any(name not in graph_inputs or name not in weight_inputs for name in compressor_weights):
+                    raise ValueError(
+                        f"DeepSeek V4 compressor weight is missing from graph inputs or weight spec: "
+                        f"{compressor_weights}"
+                    )
+                bindings.append((function, slot, calls, compressor_weights))
+
+        if not bindings:
+            return False
+
+        tensor_bindings = []
+        checkpoint_headers = {}
+        tensor_type_by_safetensors_dtype = {
+            "F16": onnx.TensorProto.FLOAT16,
+            "BF16": onnx.TensorProto.BFLOAT16,
+            "F32": onnx.TensorProto.FLOAT,
+            "F64": onnx.TensorProto.DOUBLE,
+        }
+        for function, slot, calls, compressor_weights in bindings:
+            attribute_name = f"qeff_compressor_weight_{slot}"
+            if attribute_name in function.attribute:
+                raise ValueError(f"Duplicate ONNX function weight attribute: {attribute_name}")
+            tensors = []
+            for weight_name in compressor_weights:
+                entry = weight_inputs[weight_name]
+                location = entry["location"]
+                file_ref = location["file"]
+                if isinstance(file_ref, int):
+                    file_entry = weight_spec["files"][file_ref]
+                    checkpoint_relative_path = Path(file_entry["path"] if isinstance(file_entry, dict) else file_entry)
+                else:
+                    checkpoint_relative_path = Path(file_ref)
+                    file_entry = next(
+                        (
+                            candidate
+                            for candidate in weight_spec["files"]
+                            if isinstance(candidate, dict) and candidate["path"] == file_ref
+                        ),
+                        {},
+                    )
+                file_format = file_entry.get("format", "safetensors") if isinstance(file_entry, dict) else "safetensors"
+                if file_format != "safetensors":
+                    raise ValueError(f"Unsupported checkpoint format for DeepSeek V4 compressor weight: {file_format}")
+                checkpoint_path = checkpoint_root / checkpoint_relative_path
+                if checkpoint_path not in checkpoint_headers:
+                    with checkpoint_path.open("rb") as checkpoint_file:
+                        header_size = struct.unpack("<Q", checkpoint_file.read(8))[0]
+                        checkpoint_headers[checkpoint_path] = json.loads(checkpoint_file.read(header_size))
+                tensor_info = checkpoint_headers[checkpoint_path].get(location["key"])
+                if tensor_info is None:
+                    raise KeyError(f"Weight {location['key']} not found in {checkpoint_path}")
+                tensor_type = tensor_type_by_safetensors_dtype.get(tensor_info["dtype"])
+                if tensor_type is None:
+                    raise ValueError(f"Unsupported safetensors dtype {tensor_info['dtype']} for {weight_name}")
+                data_start, data_end = tensor_info["data_offsets"]
+                tensor = onnx.TensorProto()
+                tensor.name = weight_name
+                tensor.data_type = tensor_type
+                tensor.dims.extend(tensor_info["shape"])
+                tensor.data_location = onnx.TensorProto.EXTERNAL
+                for key_name, value in (
+                    ("location", f"{prepared_checkpoint_name}/{checkpoint_path.name}"),
+                    ("offset", str(8 + header_size + data_start)),
+                    ("length", str(data_end - data_start)),
+                ):
+                    external_entry = tensor.external_data.add()
+                    external_entry.key = key_name
+                    external_entry.value = value
+                tensors.append(tensor)
+            tensor_bindings.append((function, slot, calls, attribute_name, tensors))
+
+        tensor_bindings.sort(key=lambda binding: (binding[0].name, binding[1]), reverse=True)
+        detached_weight_names = set()
+        for function, slot, calls, attribute_name, tensors in tensor_bindings:
+            formal_weight_name = function.input[slot]
+            constant_output = f"{formal_weight_name}_qeff_constant"
+            constant = onnx.NodeProto()
+            constant.op_type = "Constant"
+            constant.name = f"{attribute_name}_constant"
+            constant.output.append(constant_output)
+            constant_value = constant.attribute.add()
+            constant_value.name = "value"
+            constant_value.type = onnx.AttributeProto.TENSOR
+            constant_value.ref_attr_name = attribute_name
+            function.node.insert(0, constant)
+            function.attribute.append(attribute_name)
+            for function_node in function.node[1:]:
+                for input_index, input_name in enumerate(function_node.input):
+                    if input_name == formal_weight_name:
+                        function_node.input[input_index] = constant_output
+            del function.input[slot]
+
+            for call, tensor in zip(calls, tensors):
+                detached_weight_names.add(call.input[slot])
+                call.attribute.append(onnx.helper.make_attribute(attribute_name, tensor))
+                del call.input[slot]
+
+        graph_consumers = {input_name for node in model.graph.node for input_name in node.input}
+        unused_detached_weights = detached_weight_names - graph_consumers
+        retained_graph_inputs = [value for value in model.graph.input if value.name not in unused_detached_weights]
+        model.graph.ClearField("input")
+        model.graph.input.extend(retained_graph_inputs)
+        weight_spec["inputs"] = [
+            entry for entry in weight_spec["inputs"] if entry["name"] not in unused_detached_weights
+        ]
+        weight_spec_path.write_text(json.dumps(weight_spec, indent=2, sort_keys=True), encoding="utf-8")
+        return True
 
 
 class QEffDeepseekV4Model(DeepseekV4Model):
@@ -2998,8 +3213,13 @@ class QEffDeepseekV4Model(DeepseekV4Model):
             "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
             "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
         }
-        for layer in self.layers:
-            hidden_states = layer(
+        prefill_cache = any(
+            bool(getattr(self.config, flag, False))
+            for flag in ("qeff_swa_prefill_only", "qeff_csa_prefill_only", "qeff_hca_prefill_only")
+        )
+        retained_states = list(cache.to_legacy_cache()) if prefill_cache else None
+        for layer_idx, layer in enumerate(self.layers):
+            layer_output = layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
@@ -3008,16 +3228,36 @@ class QEffDeepseekV4Model(DeepseekV4Model):
                 past_key_values=cache,
                 **kwargs,
             )
+            if isinstance(layer_output, tuple):
+                hidden_states, *layer_states = layer_output
+                state_names = QEffDeepseekV4Cache.state_names_for_layer_type(self.config.layer_types[layer_idx])
+                if len(layer_states) != len(state_names):
+                    raise ValueError(
+                        f"Layer {layer_idx} returned {len(layer_states)} cache states; expected {len(state_names)}."
+                    )
+                if retained_states is not None:
+                    retained_states[layer_idx] = tuple(layer_states)
+                if not _is_export_capture():
+                    cache_layer = cache.layers[layer_idx]
+                    for state_name, state in zip(state_names, layer_states):
+                        setattr(cache_layer, state_name, state)
+            else:
+                hidden_states = layer_output
         hidden_states = self.norm(self.hc_head(hidden_states)).to(inputs_embeds.dtype)
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=cache.to_legacy_cache() if use_cache is not False else None,
+            past_key_values=(tuple(retained_states) if prefill_cache else cache.to_legacy_cache())
+            if use_cache is not False
+            else None,
         )
 
 
 class QEffDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
     def get_submodules_for_export(self) -> type[nn.Module]:
         return {QEffDeepseekV4DecoderLayer}
+
+    def get_onnx_transforms_for_export(self) -> list[type]:
+        return [DeepseekV4CompressorWeightAttributeTransform]
 
     def get_specializations(self, batch_size: int, prefill_seq_len: int, ctx_len: int, **kwargs: Any) -> list[dict]:
         del kwargs
@@ -3043,14 +3283,7 @@ class QEffDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
 
     def get_onnx_past_key_value_names(self, layer_idx: int, layer_state: tuple[torch.Tensor, ...]) -> list[str]:
         layer_type = self.config.layer_types[layer_idx]
-        if layer_type == "sliding_attention":
-            state_names = ("sliding_window_kv",)
-        elif layer_type == "heavily_compressed_attention":
-            state_names = QEffDeepseekV4Cache._HCA_STATE_NAMES
-        elif layer_type == "compressed_sparse_attention":
-            state_names = QEffDeepseekV4Cache._CSA_STATE_NAMES
-        else:
-            raise ValueError(f"Unsupported DeepSeek V4 attention layer type: {layer_type}")
+        state_names = QEffDeepseekV4Cache.state_names_for_layer_type(layer_type)
         if len(layer_state) != len(state_names):
             raise ValueError(f"Layer {layer_idx} cache has {len(layer_state)} tensors; expected {len(state_names)}.")
         return [f"past_{name}.{layer_idx}" for name in state_names]

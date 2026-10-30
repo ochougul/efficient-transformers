@@ -823,6 +823,12 @@ class QEFFBaseModel(ABC):
 
             onnx_transforms = OnnxTransformPipeline(transforms=active_transforms)
             model, transformed = onnx_transforms.apply(model, **transform_kwargs)
+            export_transforms = []
+            get_export_transforms = getattr(self.model, "get_onnx_transforms_for_export", None)
+            if self._weight_free and getattr(self, "_use_onnx_subfunctions", False) and callable(get_export_transforms):
+                for transform in get_export_transforms():
+                    if transform.apply(model, weight_spec_path=export_result.weight_spec_path):
+                        export_transforms.append(transform.__name__)
 
             # Keep this strictly layerwise-scoped so regular non-layerwise export
             # remains backward compatible.
@@ -830,6 +836,7 @@ class QEFFBaseModel(ABC):
                 _restore_retained_state_output_names(model, output_names)
 
             transform_names = [transform.__name__ for transform in self._pytorch_transforms + active_transforms]
+            transform_names.extend(export_transforms)
             model.metadata_props.append(
                 onnx.StringStringEntryProto(key="qeff_transforms", value=",".join(transform_names))
             )

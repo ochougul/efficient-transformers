@@ -8,6 +8,8 @@
 import torch
 
 from QEfficient.customop.ctx_scatter_gather import (  # noqa: E402
+    CSAJointAttention,
+    CSAJointAttentionFunc,
     CtxGather,
     CtxGather3D,
     CtxGatherBlockedKV,
@@ -30,6 +32,36 @@ from QEfficient.customop.ctx_scatter_gather_cb import (  # noqa: E402
 )
 from QEfficient.customop.onnxscript_utils import get_dynamo_onnxscript_func
 from QEfficient.customop.rms_norm import CustomRMSNorm  # noqa: E402
+
+
+@torch.library.custom_op("qefficient::csa_joint_attention", mutates_args=())
+def csa_joint_attention_op(
+    local_kv: torch.Tensor,
+    local_valid: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    compressed_indices: torch.Tensor,
+    compressed_valid: torch.Tensor,
+    query: torch.Tensor,
+    sinks: torch.Tensor,
+    scale: torch.Tensor,
+    masked_logit: torch.Tensor,
+) -> torch.Tensor:
+    return CSAJointAttentionFunc.forward(
+        local_kv,
+        local_valid,
+        compressed_kv,
+        compressed_indices,
+        compressed_valid,
+        query,
+        sinks,
+        scale,
+        masked_logit,
+    )
+
+
+@csa_joint_attention_op.register_fake
+def _(local_kv, local_valid, compressed_kv, compressed_indices, compressed_valid, query, sinks, scale, masked_logit):
+    return torch.empty_like(query)
 
 
 @torch.library.custom_op("qefficient::rms_norm", mutates_args=())
@@ -483,6 +515,7 @@ def _(data: torch.Tensor, position_ids: torch.Tensor, updates: torch.Tensor) -> 
 # ---------------------------------------------------------------------------
 
 DYNAMO_CUSTOM_OP_TABLE = {
+    torch.ops.qefficient.csa_joint_attention.default: get_dynamo_onnxscript_func(CSAJointAttention),
     torch.ops.qefficient.rms_norm.default: get_dynamo_onnxscript_func(CustomRMSNorm),
     torch.ops.qefficient.ctx_scatter.default: get_dynamo_onnxscript_func(CtxScatter),
     torch.ops.qefficient.ctx_scatter_3d.default: get_dynamo_onnxscript_func(CtxScatter3D),
